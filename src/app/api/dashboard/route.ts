@@ -21,8 +21,24 @@ import {
 import { reverseGeocodeProvince, geocodeSiteName } from "@/lib/geo";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 
-/** Healthy payload matches the 20m status cycle; limited/degraded re-seat to 15s. */
+/** Healthy payload matches the 100m status cycle; limited/degraded re-seat to 15s. */
 const DASHBOARD_TTL_MS = DEVICE_STATUS_INTERVAL_SECONDS * 1000;
+
+/**
+ * Warn-log rows are reused between cycles while a group's offline count is
+ * unchanged; this caps how stale a quiet group's device identities may get.
+ */
+const WARN_LOG_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Cross-build warn-log store (module scope — must outlive a single request).
+ * Without it every 100-minute rebuild re-queried every offline shared group
+ * (~15-30 calls) even though nothing had changed.
+ */
+const warnLogsByGroup = new Map<
+  number,
+  { rows: RuijieWarnLog[]; fetchedAt: number; offlineCount: number }
+>();
 
 export interface RateLimitedCredential {
   id: string;
@@ -334,11 +350,13 @@ async function buildDashboard(
       number,
       { latitude?: number; longitude?: number }
     >();
+    const ownedGroupIds = new Set<number>();
     for (const cred of creds) {
       const credentials = toRuijieCreds(cred);
       if (getRateLimitStatus(credentials).limited) continue;
       try {
         for (const p of await getProjects(credentials)) {
+          ownedGroupIds.add(p.groupId);
           if (p.latitude != null && p.longitude != null) {
             ownedGeoByGroup.set(p.groupId, {
               latitude: p.latitude,
@@ -388,19 +406,28 @@ async function buildDashboard(
     // Lazy per-group warn logs — only fetched for shared projects that need
     // device identity. The global warnlog list is capped (5 pages), so groups
     // deep in history never appear in it; `group_id` scopes the query.
-    const warnLogsByGroup = new Map<number, RuijieWarnLog[]>();
+    // Reuse/refresh policy lives with the module-scope `warnLogsByGroup`.
     const loadWarnLogsForGroup = async (
-      groupId: number
+      groupId: number,
+      offlineCount: number
     ): Promise<RuijieWarnLog[]> => {
-      const cached = warnLogsByGroup.get(groupId);
-      if (cached) return cached;
+      const hit = warnLogsByGroup.get(groupId);
+      if (
+        hit &&
+        hit.offlineCount === offlineCount &&
+        Date.now() - hit.fetchedAt < WARN_LOG_MAX_AGE_MS
+      ) {
+        return hit.rows;
+      }
 
       let rows: RuijieWarnLog[] = [];
+      let answered = false;
       for (const c of creds) {
         const credentials = toRuijieCreds(c);
         if (getRateLimitStatus(credentials).limited) continue;
         try {
           rows = await getWarnLogsForGroup(credentials, groupId);
+          answered = true;
         } catch (e) {
           if (isRateLimitError(e)) {
             const st = getRateLimitStatus(credentials);
@@ -412,7 +439,15 @@ async function buildDashboard(
         if (rows.length > 0) break;
       }
 
-      warnLogsByGroup.set(groupId, rows);
+      // Only remember answers a credential actually gave — a rate-limited
+      // build must not freeze empty rows in place of a future fetch.
+      if (answered) {
+        warnLogsByGroup.set(groupId, {
+          rows,
+          fetchedAt: Date.now(),
+          offlineCount,
+        });
+      }
       return rows;
     };
 
@@ -431,17 +466,21 @@ async function buildDashboard(
         continue;
       }
 
-      // Fetch received/shared projects (1 API call, already has device counts)
+      // Fetch received/shared projects (1 API call, already has device counts).
+      // Explicit empty selection owns no shared groups — skip the list call.
+      const receivedSel = cred.selected_received_group_ids as number[] | null;
+      const skipReceived =
+        Array.isArray(receivedSel) && receivedSel.length === 0;
       try {
-        const receivedAll = await getReceivedProjects(credentials);
+        const receivedAll = skipReceived
+          ? []
+          : await getReceivedProjects(credentials);
         // Shared selection: null = all, [] = none, array = specific IDs.
-        const receivedSel = cred.selected_received_group_ids as number[] | null;
-        const received =
-          receivedSel === null || receivedSel === undefined
+        const received = skipReceived
+          ? []
+          : receivedSel === null || receivedSel === undefined
             ? receivedAll
-            : receivedSel.length === 0
-              ? []
-              : receivedAll.filter((rp) => receivedSel.includes(rp.groupId));
+            : receivedAll.filter((rp) => receivedSel.includes(rp.groupId));
         for (const rp of received) {
           let onlineCount = 0;
           let offlineCount = 0;
@@ -451,6 +490,9 @@ async function buildDashboard(
             offlineCount += dt.offCount;
             totalCount += dt.totalCount;
           }
+          // Fully recovered — drop the old rows so the next outage refetches
+          // instead of matching the previous one's device identities.
+          if (offlineCount === 0) warnLogsByGroup.delete(rp.groupId);
 
           // Shared projects deny maint/devices (code 5) — never call it.
           // Prefer the owning credential's fleet slice for this group (real
@@ -460,7 +502,7 @@ async function buildDashboard(
           if (offlineCount > 0) {
             devices = fleetByGroup.get(rp.groupId) || [];
             if (devices.length === 0) {
-              const logs = await loadWarnLogsForGroup(rp.groupId);
+              const logs = await loadWarnLogsForGroup(rp.groupId, offlineCount);
               devices = warnLogsToDevices(logs, rp.groupId, offlineCount);
               devicesFromWarnLog = devices.length > 0;
             }
@@ -481,14 +523,16 @@ async function buildDashboard(
             : totalCount;
 
           // Shared sites are not in this credential's tree — prefer coords
-          // from the owning account's tree; else group detail (may be code 5).
+          // from the owning account's tree. Only ask group detail for groups
+          // one of our credentials owns: for foreign shared groups the API
+          // answers code 5, and repeating that per cycle burns rate limit.
           let receivedLat: number | undefined;
           let receivedLng: number | undefined;
           const ownedGeo = ownedGeoByGroup.get(rp.groupId);
           if (ownedGeo) {
             receivedLat = ownedGeo.latitude;
             receivedLng = ownedGeo.longitude;
-          } else {
+          } else if (ownedGroupIds.has(rp.groupId)) {
             try {
               const geo = await getGroupGeo(credentials, rp.groupId);
               receivedLat = geo.latitude;
@@ -681,6 +725,9 @@ async function buildDashboard(
       if (Date.now() > lastChanceDeadline) break;
       if (p.totalCount <= 0) continue;
       if (p.latitude != null && p.longitude != null) continue;
+      // Group detail answers code 5 for shared groups we do not own; asking
+      // for them every cycle spends rate limit on a guaranteed denial.
+      if (!ownedGroupIds.has(p.groupId)) continue;
       for (const cred of creds) {
         if (Date.now() > lastChanceDeadline) break;
         const credentials = toRuijieCreds(cred);

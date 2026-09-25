@@ -7,6 +7,19 @@ import {
   CacheFetchResult,
 } from "@/lib/cache";
 import { diskGet, diskSet, diskDelete } from "@/lib/disk-cache";
+import { appendFileSync, existsSync } from "node:fs";
+import nodePath from "node:path";
+
+/** Debug trace: create .cache/ruijie-calls.log to record every Ruijie call. */
+const TRACE_FILE = nodePath.join(process.cwd(), ".cache", "ruijie-calls.log");
+function traceCall(msg: string): void {
+  try {
+    if (!existsSync(TRACE_FILE)) return;
+    appendFileSync(TRACE_FILE, `${new Date().toISOString()} ${msg}\n`);
+  } catch {
+    // tracing must never break a request
+  }
+}
 
 export interface RuijieCredentials {
   appId: string;
@@ -94,6 +107,7 @@ export async function getRuijieToken(
     expiry: Date.now() + (expiresIn || 3600) * 1000 - 60000,
   });
 
+  traceCall(`TOKEN ${creds.appId}`);
   return token;
 }
 
@@ -180,19 +194,23 @@ async function fetchRuijie<T>(
   const token = await getRuijieToken(creds);
   const separator = path.includes("?") ? "&" : "?";
   const url = `${baseUrl}${path}${separator}access_token=${token}`;
+  traceCall(`REQ ${path}`);
   const response = await throttledFetch(creds, url);
 
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("application/json")) {
+    traceCall(`BADCT ${path}`);
     throw new Error(`Non-JSON response from Ruijie API: ${path}`);
   }
 
   const data = await response.json();
 
   if (data.code === 44) {
+    traceCall(`LIMIT ${path}`);
     startCooldown(creds);
     throw rateLimitError(creds, path);
   }
+  traceCall(`RES ${path} code=${data.code}`);
 
   // Token expired — clear cache and retry once
   if ((data.code === 3 || data.code === 401) && !_isRetry) {
@@ -454,16 +472,35 @@ export async function getReceivedProjects(
   );
 }
 
+interface GroupGeo {
+  latitude?: number;
+  longitude?: number;
+}
+
 /**
  * Leaf/group coordinates for a group id (`GET /service/api/group/{id}`).
- * Cached for the tree TTL — site locations rarely move.
+ *
+ * Denials (shared groups the credential does not own → code 5) are persisted
+ * too: without that, every cold build re-asked for ~130 groups we cannot read,
+ * which alone can trip the per-app rate limit.
  */
 export async function getGroupGeo(
   creds: RuijieCredentials,
   groupId: number
-): Promise<{ latitude?: number; longitude?: number }> {
-  return cacheFetch(
-    `group-geo:v1:${credKey(creds)}:${groupId}`,
+): Promise<GroupGeo> {
+  const key = `group-geo:v1:${credKey(creds)}:${groupId}`;
+
+  const mem = cacheGet<GroupGeo>(key);
+  if (mem) return mem;
+
+  const disk = diskGet<GroupGeo>(key);
+  if (disk !== undefined) {
+    cacheSet(key, disk, TTL_TREE_MS);
+    return disk;
+  }
+
+  const { value, stale } = await cacheFetchDetailed<GroupGeo>(
+    key,
     TTL_TREE_MS,
     async () => {
       const data = await fetchRuijie<{
@@ -481,6 +518,9 @@ export async function getGroupGeo(
       };
     }
   );
+
+  if (!stale) diskSet(key, value);
+  return value;
 }
 
 async function fetchDevicesPage(
