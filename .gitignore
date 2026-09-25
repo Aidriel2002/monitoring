@@ -17,6 +17,9 @@
 /.next/
 /out/
 
+# durable server cache (device inventory, geocode)
+/.cache/
+
 # production
 /build
 
