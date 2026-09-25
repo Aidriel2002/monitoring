@@ -74,6 +74,22 @@ function formatOfflineDays(lastOnline: number): string {
   return formatDowntime(lastOnline);
 }
 
+/** Exact last-seen moment, GMT+8 — matches the header clock. */
+function formatLastSeen(lastOnline: number): string {
+  if (!lastOnline) return "";
+  return (
+    new Date(lastOnline).toLocaleString("en-US", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    }) + " GMT+8"
+  );
+}
+
 function getSiteOldestOffline(site: Project): number {
   // Ignore devices with unknown lastOnline (0) — one unknown must not hide
   // the known downtime of the rest of the site.
@@ -290,9 +306,14 @@ export default function SitesPage() {
                             </p>
                           )}
                           {oldest > 0 && project.offlineCount > 0 && (
-                            <p className="text-xs text-orange-700 mt-0.5 font-semibold">
-                              Offline: {formatOfflineDays(oldest)}
-                            </p>
+                            <>
+                              <p className="text-xs text-orange-700 mt-0.5 font-semibold">
+                                Offline: {formatOfflineDays(oldest)}
+                              </p>
+                              <p className="text-[11px] text-orange-600/80">
+                                since {formatLastSeen(oldest)}
+                              </p>
+                            </>
                           )}
                         </div>
                         <div className="flex items-center gap-3 text-sm shrink-0 ml-4">

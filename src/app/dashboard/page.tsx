@@ -153,6 +153,22 @@ function formatOfflineDays(lastOnline: number): string {
   return formatDowntime(lastOnline);
 }
 
+/** Exact last-seen moment, GMT+8 — matches the header clock. */
+function formatLastSeen(lastOnline: number): string {
+  if (!lastOnline) return "";
+  return (
+    new Date(lastOnline).toLocaleString("en-US", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    }) + " GMT+8"
+  );
+}
+
 function getSiteOldestOffline(site: Project): number {
   // Ignore devices with unknown lastOnline (0) — one unknown must not hide
   // the known downtime of the rest of the site.
@@ -656,9 +672,14 @@ export default function Dashboard() {
                                 </p>
                               )}
                               {oldest > 0 && (
-                                <p className="text-[11px] font-semibold text-orange-700 mt-0.5">
-                                  {formatOfflineDays(oldest)}
-                                </p>
+                                <>
+                                  <p className="text-[11px] font-semibold text-orange-700 mt-0.5">
+                                    {formatOfflineDays(oldest)}
+                                  </p>
+                                  <p className="text-[10px] text-orange-600/80 leading-tight">
+                                    since {formatLastSeen(oldest)}
+                                  </p>
+                                </>
                               )}
                               {site.totalCount === 0 && (
                                 <p className="text-[10px] text-orange-500">No devices</p>
@@ -749,9 +770,12 @@ export default function Dashboard() {
                             )}
                           </div>
                           {!device.detailsUnavailable && device.lastOnline > 0 && (
-                            <div className="text-right shrink-0">
-                              <span className="text-[11px] text-orange-700 font-semibold">
+                            <div className="text-right shrink-0 max-w-[10.5rem]">
+                              <span className="block text-[11px] text-orange-700 font-semibold">
                                 {formatOfflineDays(device.lastOnline)}
+                              </span>
+                              <span className="block text-[10px] text-orange-600/80 leading-tight">
+                                {formatLastSeen(device.lastOnline)}
                               </span>
                             </div>
                           )}
