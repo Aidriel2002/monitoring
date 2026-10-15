@@ -17,6 +17,11 @@
 
 [build.environment]
   NODE_VERSION = "22"
+  # Netlify secrets scan exemption: the bot token lands in the Turbopack
+  # build cache (.netlify/.next/cache/*.sst) during compilation. That cache
+  # is never deployed — deployed server bundles read TELEGRAM_BOT_TOKEN from
+  # the runtime environment instead — so scanning it is a false positive.
+  SECRETS_SCAN_OMIT_PATHS = ".netlify/.next/cache"
 
 # No [functions] timeout block: Netlify's synchronous execution limit is
 # 60 seconds by default and no longer configurable — more than enough for
