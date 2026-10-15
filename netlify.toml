@@ -18,10 +18,9 @@
 [build.environment]
   NODE_VERSION = "22"
 
-[functions]
-  # Fresh dashboard rebuilds (Ruijie pagination + geocoding) exceed Netlify's
-  # 10s default timeout; 26s is the maximum standard timeout.
-  timeout = 26
+# No [functions] timeout block: Netlify's synchronous execution limit is
+# 60 seconds by default and no longer configurable — more than enough for
+# cold dashboard rebuilds (Ruijie pagination + geocoding).
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"
