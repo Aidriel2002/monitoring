@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheFetch, cacheClear, cacheGet, cacheSet } from "@/lib/cache";
 import { diskGet, diskSet } from "@/lib/disk-cache";
@@ -245,32 +245,21 @@ export async function GET(request: Request) {
 
     // One shared payload per user — concurrent tab polls hit memory, not Ruijie.
     // Degraded / rate-limited results get a short TTL so they self-heal.
+    // The loader ONLY builds the payload. Post-rebuild side effects (realtime
+    // broadcast, Telegram outage reports) run via after() below so the HTTP
+    // response is never blocked on them — critical on serverless hosts (Netlify)
+    // where awaiting Telegram before responding pushes the function past its
+    // timeout and the gateway returns 502.
+    let rebuilt = false;
     const payload =
       coolingCred && cached
         ? cached
         : await cacheFetch(cacheKey, DASHBOARD_TTL_MS, async () => {
-            const built = await buildDashboard(creds, {
+            rebuilt = true;
+            return buildDashboard(creds, {
               forceGeo: forceStatus,
               prev: cached,
             });
-            // Push fresh data (and limit flags) to open dashboards without waiting
-            // for the client's poll — realtime costs no Ruijie quota. Awaited so
-            // serverless hosts (Netlify) don't freeze it after the response.
-            await broadcastDashboardUpdate(user.id, {
-              rateLimitedCredentials: built.rateLimitedCredentials,
-              degraded: built.degraded,
-            });
-            // Telegram outage report to contact incharges — runs only on fresh
-            // rebuilds: the 100-min TTL expiry and manual Sync Data. Awaited
-            // (bounded by Telegram timeouts) so serverless hosts cannot kill
-            // it after the response is written.
-            await sendOfflineReports(user.id, built).catch((e) =>
-              console.warn(
-                "Offline notifications failed:",
-                e instanceof Error ? e.message : e
-              )
-            );
-            return built;
           });
 
     // Overlay live cooldown state on every response — even when the dashboard
@@ -311,12 +300,34 @@ export async function GET(request: Request) {
       cacheSet(cacheKey, response, ttl);
     }
 
-    // Bot inbox housekeeping: link phone numbers and reply to new chats so
-    // the bot responds within ~a minute of being messaged. Throttled inside
-    // (one scan per minute). Awaited (not fire-and-forget) so serverless
-    // hosts don't freeze it after the response is written; the throttle
-    // keeps the extra latency to ~one scan per minute per instance.
-    await processTelegramInbox().catch(() => undefined);
+    // Post-response side effects — scheduled via after() so the HTTP response
+    // is returned immediately and the work is kept alive to completion. Awaiting
+    // any of these before responding is what caused Netlify 502s: Telegram +
+    // realtime calls can take seconds, and the function gateway kills the
+    // request when it exceeds its timeout. after() runs them after the response
+    // is flushed but does not freeze them (unlike fire-and-forget void).
+    after(async () => {
+      if (rebuilt) {
+        // Push fresh data (and limit flags) to open dashboards — realtime costs
+        // no Ruijie quota.
+        await broadcastDashboardUpdate(user.id, {
+          rateLimitedCredentials: payload.rateLimitedCredentials,
+          degraded: payload.degraded,
+        }).catch(() => undefined);
+        // Telegram outage report to contact incharges — runs only on fresh
+        // rebuilds: the 100-min TTL expiry and manual Sync Data.
+        await sendOfflineReports(user.id, payload).catch((e) =>
+          console.warn(
+            "Offline notifications failed:",
+            e instanceof Error ? e.message : e
+          )
+        );
+      }
+      // Bot inbox housekeeping: link phone numbers and reply to new chats so
+      // the bot responds within ~a minute of being messaged. Throttled inside
+      // (one scan per minute per instance).
+      await processTelegramInbox().catch(() => undefined);
+    });
 
     return NextResponse.json({
       ...response,
