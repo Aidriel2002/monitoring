@@ -20,15 +20,56 @@ body {
 }
 
 /* Preflight sets `color: inherit` on controls — without this, dark-mode
-   body text (#ededed) becomes near-white on white inputs (invisible). */
-input,
-select,
-textarea,
-button {
-  color: #171717;
+   body text (#ededed) becomes near-white on white inputs (invisible).
+   Must stay in @layer base: unlayered rules beat Tailwind's layered
+   utilities (text-white, text-blue-600, ...) and would override them. */
+@layer base {
+  input,
+  select,
+  textarea,
+  button {
+    color: #171717;
+  }
 }
 
 input::placeholder,
 textarea::placeholder {
   color: #9ca3af;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(1rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.toast-in {
+  animation: toast-in 0.2s ease-out;
+}
+
+/* Permanent site-name label above each map marker (Leaflet tooltip). */
+.leaflet-tooltip.map-site-label {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin-top: -4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #111827;
+  white-space: nowrap;
+  pointer-events: none;
+  text-shadow:
+    0 0 3px #fff,
+    0 0 6px #fff,
+    0 1px 2px #fff;
+}
+
+.leaflet-tooltip.map-site-label::before {
+  display: none;
 }

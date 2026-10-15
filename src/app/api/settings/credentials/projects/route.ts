@@ -7,6 +7,12 @@ import {
   getReceivedProjects,
   RuijieCredentials,
 } from "@/lib/ruijie";
+import {
+  CachedSharedProject,
+  mapSharedProjects,
+  parseProjectsCache,
+  ProjectsCache,
+} from "@/lib/projects-cache";
 
 async function getUser(request: Request) {
   const cookieHeader = request.headers.get("cookie") || "";
@@ -62,41 +68,66 @@ export async function GET(request: Request) {
       baseUrl: cred.base_url || undefined,
     };
 
+    const cache = parseProjectsCache(
+      (cred as { projects_cache?: unknown }).projects_cache
+    );
+
+    if (cache) {
+      return NextResponse.json({
+        projects: cache.projects,
+        tree: cache.tree,
+        selectedGroupIds: expandSelectionToLeaves(
+          cache.tree,
+          cred.selected_group_ids as number[] | null
+        ),
+        sharedProjects: cache.sharedProjects,
+        selectedReceivedGroupIds:
+          (cred.selected_received_group_ids as number[] | null) ?? null,
+        fetchedAt: cache.fetchedAt,
+      });
+    }
+
     const { tree, flat } = await fetchProjectTree(credentials);
 
     // Shared/received projects (flat list — no parent tree).
-    let sharedProjects: {
-      groupId: number;
-      name: string;
-      type: string;
-      description: string;
-      tenantName: string;
-      totalCount: number;
-    }[] = [];
+    let sharedProjects: CachedSharedProject[] = [];
     try {
       const received = await getReceivedProjects(credentials);
-      sharedProjects = received.map((rp) => ({
-        groupId: rp.groupId,
-        name: rp.groupName,
-        type: "RECEIVED",
-        description: `Shared by ${rp.tenantName}`,
-        tenantName: rp.tenantName,
-        totalCount: (rp.devTypeDetail || []).reduce(
-          (sum, dt) => sum + (dt.totalCount || 0),
-          0
-        ),
-      }));
+      sharedProjects = mapSharedProjects(received);
     } catch {
       // Shared list may be denied — owned projects still return.
     }
 
-    return NextResponse.json({
+    const fetchedAt = Date.now();
+    const built: ProjectsCache = {
+      fetchedAt,
       projects: flat.map((p) => ({
         groupId: p.groupId,
         name: p.name,
         type: p.type,
         description: p.description,
       })),
+      tree,
+      sharedProjects,
+    };
+    try {
+      const { error: saveError } = await supabase
+        .from("api_credentials")
+        .update({ projects_cache: built })
+        .eq("id", credentialId)
+        .eq("user_id", user.id);
+      if (saveError) {
+        console.warn("projects_cache bootstrap skipped:", saveError.message);
+      }
+    } catch (e) {
+      console.warn(
+        "projects_cache bootstrap skipped:",
+        e instanceof Error ? e.message : e
+      );
+    }
+
+    return NextResponse.json({
+      projects: built.projects,
       tree,
       selectedGroupIds: expandSelectionToLeaves(
         tree,
@@ -105,6 +136,7 @@ export async function GET(request: Request) {
       sharedProjects,
       selectedReceivedGroupIds:
         (cred.selected_received_group_ids as number[] | null) ?? null,
+      fetchedAt,
     });
   } catch (error) {
     return NextResponse.json(
@@ -160,14 +192,16 @@ export async function POST(request: Request) {
     };
 
     // Always persist leaf IDs only (expand parents; drop unknown IDs).
-    const { tree } = await fetchProjectTree(credentials);
+    const cache = parseProjectsCache(
+      (cred as { projects_cache?: unknown }).projects_cache
+    );
+    const tree = cache
+      ? cache.tree
+      : (await fetchProjectTree(credentials)).tree;
     const normalized =
       selectedGroupIds === null || selectedGroupIds === undefined
         ? null
-        : expandSelectionToLeaves(
-            tree,
-            selectedGroupIds as number[] | null
-          );
+        : expandSelectionToLeaves(tree, selectedGroupIds as number[] | null);
 
     // Shared projects are a flat list — only drop IDs no longer present.
     let normalizedReceived: number[] | null = null;
@@ -176,8 +210,11 @@ export async function POST(request: Request) {
         normalizedReceived = null;
       } else {
         try {
-          const received = await getReceivedProjects(credentials);
-          const valid = new Set(received.map((rp) => rp.groupId));
+          const valid = new Set(
+            cache
+              ? cache.sharedProjects.map((p) => p.groupId)
+              : (await getReceivedProjects(credentials)).map((rp) => rp.groupId)
+          );
           const requested = Array.isArray(selectedReceivedGroupIds)
             ? selectedReceivedGroupIds
             : [];

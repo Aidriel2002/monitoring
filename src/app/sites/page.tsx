@@ -30,6 +30,8 @@ interface Project {
   onlineCount: number;
   offlineCount: number;
   totalCount: number;
+  /** Server-side outage start — used when device history is unavailable. */
+  oldestOffline?: number;
 }
 
 const LOAD_MORE = 30;
@@ -96,8 +98,10 @@ function getSiteOldestOffline(site: Project): number {
   const times = site.devices
     .filter((d) => d.onlineStatus !== "ON" && d.lastOnline > 0)
     .map((d) => d.lastOnline);
-  if (times.length === 0) return 0;
-  return Math.min(...times);
+  if (times.length > 0) return Math.min(...times);
+  // Shared projects whose device history is denied still carry the outage
+  // start the server tracked from aggregate counts.
+  return site.oldestOffline || 0;
 }
 
 export default function SitesPage() {
@@ -202,7 +206,7 @@ export default function SitesPage() {
           <div className="flex items-center gap-4">
             <button
               onClick={() => router.push("/dashboard")}
-              className="px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+              className="px-3 py-2 text-sm font-medium text-gray-600 bg-transparent border border-gray-500 rounded-md hover:bg-gray-100"
             >
               &larr; Dashboard
             </button>
@@ -218,7 +222,7 @@ export default function SitesPage() {
             </p>
             <button
               onClick={() => router.push("/login")}
-              className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700 shrink-0 ml-4"
+              className="px-4 py-2 text-sm font-medium text-red-600 bg-transparent border border-red-600 rounded-md hover:bg-red-50 shrink-0 ml-4"
             >
               Log in again
             </button>
@@ -236,30 +240,30 @@ export default function SitesPage() {
           <div className="flex gap-2 flex-wrap">
             <button
               onClick={() => setFilter("all")}
-              className={`px-3 py-2 text-sm font-medium rounded-md border ${
+              className={`px-3 py-2 text-sm font-medium rounded-md border bg-transparent ${
                 filter === "all"
-                  ? "bg-gray-900 text-white border-gray-900"
-                  : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50"
+                  ? "text-gray-900 border-gray-900"
+                  : "text-gray-500 border-gray-400 hover:border-gray-600 hover:text-gray-700"
               }`}
             >
               All ({projects.length})
             </button>
             <button
               onClick={() => setFilter("offline")}
-              className={`px-3 py-2 text-sm font-medium rounded-md border ${
+              className={`px-3 py-2 text-sm font-medium rounded-md border bg-transparent ${
                 filter === "offline"
-                  ? "bg-red-600 text-white border-red-600"
-                  : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50"
+                  ? "text-red-600 border-red-600"
+                  : "text-gray-500 border-gray-400 hover:border-red-400 hover:text-red-500"
               }`}
             >
               Offline ({offlineCount})
             </button>
             <button
               onClick={() => setFilter("online")}
-              className={`px-3 py-2 text-sm font-medium rounded-md border ${
+              className={`px-3 py-2 text-sm font-medium rounded-md border bg-transparent ${
                 filter === "online"
-                  ? "bg-green-600 text-white border-green-600"
-                  : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50"
+                  ? "text-green-600 border-green-600"
+                  : "text-gray-500 border-gray-400 hover:border-green-400 hover:text-green-500"
               }`}
             >
               Online ({onlineCount})

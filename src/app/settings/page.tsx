@@ -3,6 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { authFetch } from "@/lib/auth-fetch";
+import ConfirmModal, { ConfirmDialog } from "@/components/ConfirmModal";
+import Modal from "@/components/Modal";
+import ToastContainer, { ToastItem } from "@/components/Toast";
+import ContactDetails from "@/components/ContactDetails";
 
 interface Credential {
   id: string;
@@ -184,17 +188,22 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [testing, setTesting] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<Record<string, string>>({});
   const [fetchingCred, setFetchingCred] = useState<string | null>(null);
-  const [fetchResult, setFetchResult] = useState<Record<string, string>>({});
+  const [togglingCred, setTogglingCred] = useState<string | null>(null);
   /** credId → epoch ms of last successful/started fetch (1/minute spam guard). */
   const [fetchCooldownUntil, setFetchCooldownUntil] = useState<Record<string, number>>({});
   const [fetchCooldownTick, setFetchCooldownTick] = useState(0);
   const [managingCredId, setManagingCredId] = useState<string | null>(null);
   const manageRef = useRef<HTMLDivElement>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
+
+  // Toast notifications (Test / Sync devices)
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastIdRef = useRef(0);
 
   // Project selection state
-  const [expandedCredId, setExpandedCredId] = useState<string | null>(null);
+  const [projectsModalCredId, setProjectsModalCredId] = useState<string | null>(null);
+  const [projectsFetchedAt, setProjectsFetchedAt] = useState<Record<string, number>>({});
   const [availableProjects, setAvailableProjects] = useState<Record<string, Project[]>>({});
   const [projectTrees, setProjectTrees] = useState<Record<string, TreeNode[]>>({});
   const [selectedIds, setSelectedIds] = useState<Record<string, number[] | null>>({});
@@ -204,6 +213,9 @@ export default function SettingsPage() {
   const [savingProjects, setSavingProjects] = useState<string | null>(null);
   const [projectsError, setProjectsError] = useState<Record<string, string>>({});
   const [authExpired, setAuthExpired] = useState(false);
+  const [activeTab, setActiveTab] = useState<"credentials" | "contacts">(
+    "credentials"
+  );
 
   const router = useRouter();
 
@@ -242,6 +254,31 @@ export default function SettingsPage() {
     if (fetchingCred === cred.id) return true;
     if (fetchingCred !== null) return true; // one at a time
     return fetchDevicesCooldownSec(cred.id) > 0;
+  }
+
+  function pushToast(kind: ToastItem["kind"], message: string): number {
+    const id = ++toastIdRef.current;
+    setToasts((prev) => [...prev, { id, kind, message }]);
+    return id;
+  }
+
+  function updateToast(
+    id: number,
+    kind: ToastItem["kind"],
+    message: string
+  ) {
+    setToasts((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, kind, message } : t))
+    );
+    if (kind !== "loading") {
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 4500);
+    }
+  }
+
+  function dismissToast(id: number) {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
   }
 
   async function fetchCredentials() {
@@ -300,38 +337,80 @@ export default function SettingsPage() {
     }
   }
 
-  async function handleDelete(id: string) {
-    if (!confirm("Delete this credential?")) return;
+  function handleDelete(id: string) {
+    setConfirmDialog({
+      title: "Delete credential",
+      message: "Delete this credential? This cannot be undone.",
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: () => {
+        setConfirmDialog(null);
+        authFetch(`/api/settings/credentials?id=${id}`, { method: "DELETE" })
+          .then(() => fetchCredentials())
+          .catch((error) => console.error("Error deleting credential:", error));
+      },
+    });
+  }
+
+  function handleToggleActive(cred: Credential) {
+    if (togglingCred) return;
+    const disabling = cred.is_active;
+    if (disabling) {
+      setConfirmDialog({
+        title: "Disable API credential",
+        message: `Disable ${cred.name}? It will stop calling the Ruijie API and its projects will disappear from the dashboard.`,
+        confirmLabel: "Disable",
+        danger: true,
+        onConfirm: () => {
+          setConfirmDialog(null);
+          applyToggleActive(cred);
+        },
+      });
+      return;
+    }
+    applyToggleActive(cred);
+  }
+
+  async function applyToggleActive(cred: Credential) {
+    const disabling = cred.is_active;
+    setTogglingCred(cred.id);
     try {
-      await authFetch(`/api/settings/credentials?id=${id}`, { method: "DELETE" });
-      fetchCredentials();
-    } catch (error) {
-      console.error("Error deleting credential:", error);
+      const response = await authFetch("/api/settings/credentials", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: cred.id, isActive: !disabling }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setError(data.error || "Failed to update credential");
+        return;
+      }
+      setError("");
+      setCredentials((prev) =>
+        prev.map((c) =>
+          c.id === cred.id ? { ...c, is_active: data.isActive } : c
+        )
+      );
+    } catch {
+      setError("Network error");
+    } finally {
+      setTogglingCred(null);
     }
   }
 
   async function handleTest(cred: Credential) {
     setTesting(cred.id);
-    setTestResult((prev) => ({ ...prev, [cred.id]: "" }));
+    const toastId = pushToast("loading", `Testing ${cred.name}...`);
     try {
       const response = await authFetch(`/api/projects?credentialId=${cred.id}&test=true`);
       const data = await response.json();
       if (response.ok && data.projects) {
-        setTestResult((prev) => ({
-          ...prev,
-          [cred.id]: `OK - ${data.projects.length} project(s) found`,
-        }));
+        updateToast(toastId, "success", `OK - ${data.projects.length} project(s) found`);
       } else {
-        setTestResult((prev) => ({
-          ...prev,
-          [cred.id]: `Error: ${data.error || "Unknown error"}`,
-        }));
+        updateToast(toastId, "error", `Error: ${data.error || "Unknown error"}`);
       }
     } catch {
-      setTestResult((prev) => ({
-        ...prev,
-        [cred.id]: "Error: Network request failed",
-      }));
+      updateToast(toastId, "error", "Error: Network request failed");
     } finally {
       setTesting(null);
     }
@@ -343,7 +422,7 @@ export default function SettingsPage() {
     if (fetchDevicesCooldownSec(cred.id) > 0) return;
 
     setFetchingCred(cred.id);
-    setFetchResult((prev) => ({ ...prev, [cred.id]: "" }));
+    const toastId = pushToast("loading", `Syncing ${cred.name}...`);
     // Start cooldown immediately so a second click during the request is ignored.
     setFetchCooldownUntil((prev) => ({
       ...prev,
@@ -357,11 +436,12 @@ export default function SettingsPage() {
       });
       const data = await response.json();
       if (response.ok && data.ok) {
-        setFetchResult((prev) => ({
-          ...prev,
-          [cred.id]: `Synced ${data.projectCount} project(s), ${data.deviceCount} device(s)${data.receivedCount ? `, ${data.receivedCount} shared` : ""}`,
-        }));
-        // Force Projects panel to reload on next open
+        updateToast(
+          toastId,
+          "success",
+          `Synced ${data.projectCount} project(s), ${data.deviceCount} device(s)${data.receivedCount ? `, ${data.receivedCount} shared` : ""}`
+        );
+        // Force Projects modal to reload on next open
         setAvailableProjects((prev) => {
           const next = { ...prev };
           delete next[cred.id];
@@ -377,11 +457,13 @@ export default function SettingsPage() {
           delete next[cred.id];
           return next;
         });
+        setProjectsFetchedAt((prev) => {
+          const next = { ...prev };
+          delete next[cred.id];
+          return next;
+        });
       } else {
-        setFetchResult((prev) => ({
-          ...prev,
-          [cred.id]: `Error: ${data.error || "Unknown error"}`,
-        }));
+        updateToast(toastId, "error", `Error: ${data.error || "Unknown error"}`);
         // Failed fetch — allow retry after a short pause instead of full minute.
         setFetchCooldownUntil((prev) => ({
           ...prev,
@@ -389,10 +471,7 @@ export default function SettingsPage() {
         }));
       }
     } catch {
-      setFetchResult((prev) => ({
-        ...prev,
-        [cred.id]: "Error: Network request failed",
-      }));
+      updateToast(toastId, "error", "Error: Network request failed");
       setFetchCooldownUntil((prev) => ({
         ...prev,
         [cred.id]: Date.now() + 5_000,
@@ -403,12 +482,12 @@ export default function SettingsPage() {
   }
 
   async function loadProjects(credId: string) {
-    if (expandedCredId === credId) {
-      setExpandedCredId(null);
+    if (projectsModalCredId === credId) {
+      setProjectsModalCredId(null);
       return;
     }
 
-    setExpandedCredId(credId);
+    setProjectsModalCredId(credId);
     setProjectsError((prev) => ({ ...prev, [credId]: "" }));
     if (availableProjects[credId] && projectTrees[credId] && sharedProjects[credId]) {
       // Re-normalize against the cached tree when reopening.
@@ -430,6 +509,10 @@ export default function SettingsPage() {
         setAvailableProjects((prev) => ({ ...prev, [credId]: data.projects || [] }));
         const tree: TreeNode[] = data.tree || [];
         setProjectTrees((prev) => ({ ...prev, [credId]: tree }));
+        setProjectsFetchedAt((prev) => ({
+          ...prev,
+          [credId]: typeof data.fetchedAt === "number" ? data.fetchedAt : 0,
+        }));
         // Server selection is source of truth; expand legacy parent IDs → leaves.
         const saved: number[] | null =
           data.selectedGroupIds === undefined
@@ -584,17 +667,21 @@ export default function SettingsPage() {
     return `${raw.length} project(s) selected`;
   }
 
+  const projectsCred = projectsModalCredId
+    ? credentials.find((c) => c.id === projectsModalCredId) ?? null
+    : null;
+
   return (
     <div className="h-screen w-screen bg-gray-50 p-6 overflow-auto">
       <div className="w-full">
         <header className="mb-8 flex justify-between items-center">
           <div>
             <h1 className="text-3xl font-bold text-gray-900">Settings</h1>
-            <p className="mt-2 text-gray-600">Manage API credentials and select projects to monitor</p>
+            <p className="mt-2 text-gray-600">Manage API credentials, project selection, and contact incharges</p>
           </div>
           <button
             onClick={() => router.push("/dashboard")}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+            className="px-4 py-2 text-sm font-medium text-gray-600 bg-transparent border border-gray-500 rounded-md hover:bg-gray-100"
           >
             Dashboard
           </button>
@@ -607,59 +694,46 @@ export default function SettingsPage() {
             </p>
             <button
               onClick={() => router.push("/login")}
-              className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700 shrink-0 ml-4"
+              className="px-4 py-2 text-sm font-medium text-red-600 bg-transparent border border-red-600 rounded-md hover:bg-red-50 shrink-0 ml-4"
             >
               Log in again
             </button>
           </div>
         )}
 
+        <div className="flex gap-1 border-b border-gray-200 mb-6">
+          {(
+            [
+              ["credentials", "API Credentials"],
+              ["contacts", "Contact Details"],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={`px-4 py-2 text-sm font-medium rounded-t-md border-b-2 -mb-px ${
+                activeTab === id
+                  ? "border-blue-600 text-blue-600"
+                  : "border-transparent text-gray-500 hover:text-gray-700"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "contacts" && <ContactDetails />}
+
+        {activeTab === "credentials" && (
         <div className="bg-white shadow rounded-lg">
           <div className="p-6 border-b border-gray-200 flex justify-between items-center">
             <h2 className="text-xl font-semibold text-gray-900">
               API Credentials ({credentials.length})
             </h2>
-            <button onClick={() => setShowForm(!showForm)} className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-md hover:bg-emerald-700">
-              {showForm ? "Cancel" : "Add Credential"}
+            <button onClick={() => setShowForm(true)} className="px-4 py-2 text-sm font-medium text-emerald-600 bg-transparent border border-emerald-600 rounded-md hover:bg-emerald-50">
+              Add Credential
             </button>
           </div>
-
-          {showForm && (
-            <div className="p-6 border-b border-gray-200 bg-gray-50">
-              <form onSubmit={handleAdd} className="space-y-4">
-                {error && (
-                  <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">{error}</div>
-                )}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Name *</label>
-                    <input type="text" required value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} placeholder="e.g., Main Account" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">App ID *</label>
-                    <input type="text" required value={formData.appId} onChange={(e) => setFormData({ ...formData, appId: e.target.value })} className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Secret *</label>
-                    <input type="password" required value={formData.secret} onChange={(e) => setFormData({ ...formData, secret: e.target.value })} className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">Bootstrap Token</label>
-                    <input type="text" value={formData.bootstrapToken} onChange={(e) => setFormData({ ...formData, bootstrapToken: e.target.value })} placeholder="Default if empty" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className="block text-sm font-medium text-gray-700">Base URL</label>
-                    <input type="text" value={formData.baseUrl} onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })} placeholder="https://cloud-as.ruijienetworks.com" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
-                  </div>
-                </div>
-                <div className="flex justify-end">
-                  <button type="submit" disabled={saving} className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-md hover:bg-emerald-700 disabled:opacity-50">
-                    {saving ? "Saving..." : "Save Credential"}
-                  </button>
-                </div>
-              </form>
-            </div>
-          )}
 
           <div className="divide-y divide-gray-200">
             {loading ? (
@@ -673,7 +747,14 @@ export default function SettingsPage() {
                 <div key={cred.id} className="p-4">
                   <div className="flex items-center justify-between">
                     <div>
-                      <h3 className="font-medium text-gray-900">{cred.name}</h3>
+                      <h3 className="font-medium text-gray-900">
+                        {cred.name}
+                        {!cred.is_active && (
+                          <span className="ml-2 align-middle text-xs font-medium text-white bg-gray-500 rounded px-1.5 py-0.5">
+                            Disabled
+                          </span>
+                        )}
+                      </h3>
                       <p className="text-sm text-gray-500">
                         App ID: {cred.app_id} | URL: {cred.base_url}
                       </p>
@@ -683,32 +764,45 @@ export default function SettingsPage() {
                       <p className="text-xs text-blue-600 mt-1">
                         {getSelectionLabel(cred.id)}
                       </p>
-                      {testResult[cred.id] && (
-                        <p className={`text-sm mt-1 ${testResult[cred.id].startsWith("OK") ? "text-green-600" : "text-red-600"}`}>
-                          {testResult[cred.id]}
-                        </p>
-                      )}
-                      {fetchResult[cred.id] && (
-                        <p className={`text-sm mt-1 ${fetchResult[cred.id].startsWith("Synced") ? "text-green-600" : "text-red-600"}`}>
-                          {fetchResult[cred.id]}
-                        </p>
-                      )}
                     </div>
-                    <div className="relative" ref={managingCredId === cred.id ? manageRef : undefined}>
+                    <div
+                      className="relative flex items-center gap-2"
+                      ref={managingCredId === cred.id ? manageRef : undefined}
+                    >
+                      <button
+                        onClick={() => handleToggleActive(cred)}
+                        disabled={togglingCred === cred.id}
+                        title={
+                          cred.is_active
+                            ? "Stop this credential from calling the Ruijie API"
+                            : "Let this credential call the Ruijie API again"
+                        }
+                        className={`px-3 py-1 text-sm font-medium text-white rounded disabled:opacity-50 ${
+                          cred.is_active
+                            ? "bg-red-600 hover:bg-red-700"
+                            : "bg-green-600 hover:bg-green-700"
+                        }`}
+                      >
+                        {togglingCred === cred.id
+                          ? "Saving..."
+                          : cred.is_active
+                            ? "Disable API"
+                            : "Enable API"}
+                      </button>
                       <button
                         onClick={() =>
                           setManagingCredId((m) => (m === cred.id ? null : cred.id))
                         }
                         aria-expanded={managingCredId === cred.id}
                         aria-haspopup="menu"
-                        className="px-3 py-1 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700"
+                        className="px-3 py-1 text-sm font-medium text-blue-600 bg-transparent border border-blue-600 rounded hover:bg-blue-50"
                       >
                         Manage ▾
                       </button>
                       {managingCredId === cred.id && (
                         <div
                           role="menu"
-                          className="absolute right-0 mt-2 w-48 bg-white border border-gray-200 rounded-md shadow-lg z-20 py-1"
+                          className="absolute right-0 top-full mt-2 w-48 bg-white border border-gray-200 rounded-md shadow-lg z-20 p-1 space-y-1"
                         >
                           <button
                             role="menuitem"
@@ -717,7 +811,7 @@ export default function SettingsPage() {
                               handleTest(cred);
                             }}
                             disabled={testing === cred.id}
-                            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                            className="w-full text-left px-4 py-2 text-sm text-blue-600 bg-transparent rounded hover:bg-blue-50 disabled:opacity-50"
                           >
                             {testing === cred.id ? "Testing..." : "Test"}
                           </button>
@@ -729,12 +823,12 @@ export default function SettingsPage() {
                             }}
                             disabled={fetchDevicesDisabled(cred)}
                             title="Sync site tree, device list, and metadata (max 1/minute)"
-                            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
+                            className="w-full text-left px-4 py-2 text-sm text-blue-600 bg-transparent rounded hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
                           >
                             {fetchingCred === cred.id ? (
                               <>
                                 <svg
-                                  className="animate-spin h-3.5 w-3.5 text-gray-500 shrink-0"
+                                  className="animate-spin h-3.5 w-3.5 shrink-0"
                                   xmlns="http://www.w3.org/2000/svg"
                                   fill="none"
                                   viewBox="0 0 24 24"
@@ -768,9 +862,9 @@ export default function SettingsPage() {
                               setManagingCredId(null);
                               loadProjects(cred.id);
                             }}
-                            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                            className="w-full text-left px-4 py-2 text-sm text-blue-600 bg-transparent rounded hover:bg-blue-50"
                           >
-                            {expandedCredId === cred.id ? "Close projects" : "Projects"}
+                            {projectsModalCredId === cred.id ? "Close projects" : "Projects"}
                           </button>
                           <button
                             role="menuitem"
@@ -778,7 +872,7 @@ export default function SettingsPage() {
                               setManagingCredId(null);
                               handleDelete(cred.id);
                             }}
-                            className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50"
+                            className="w-full text-left px-4 py-2 text-sm text-red-600 bg-transparent rounded hover:bg-red-50"
                           >
                             Delete
                           </button>
@@ -787,180 +881,257 @@ export default function SettingsPage() {
                     </div>
                   </div>
 
-                  {/* Project selection panel */}
-                  {expandedCredId === cred.id && (
-                    <div className="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
-                      {loadingProjects === cred.id ? (
-                        <div className="text-center text-gray-500 py-4">Loading projects...</div>
-                      ) : projectsError[cred.id] ? (
-                        <div className="text-center text-red-600 py-4">
-                          <p className="font-medium">Failed to load projects</p>
-                          <p className="text-sm mt-1">{projectsError[cred.id]}</p>
-                        </div>
-                      ) : (
-                        <>
-                          <div className="flex items-center justify-between mb-3">
-                            <h4 className="text-sm font-medium text-gray-700">
-                              Select projects to monitor
-                            </h4>
-                            <div className="flex gap-2">
-                              <button onClick={() => selectAll(cred.id)} className="text-xs text-blue-600 hover:underline">
-                                Select All
-                              </button>
-                              <button onClick={() => deselectAll(cred.id)} className="text-xs text-red-600 hover:underline">
-                                Deselect All
-                              </button>
-                              <button onClick={() => saveProjectSelection(cred.id)} disabled={savingProjects === cred.id} className="px-3 py-1 text-xs font-medium text-white bg-green-600 rounded hover:bg-green-700 disabled:opacity-50">
-                                {savingProjects === cred.id ? "Saving..." : "Save Selection"}
-                              </button>
-                            </div>
-                          </div>
 
-                          <div className="space-y-1">
-                            {(projectTrees[cred.id] || []).length > 0 ? (
-                              (projectTrees[cred.id] || []).map((node) => (
-                                <TreeNodeRow
-                                  key={node.groupId}
-                                  node={node}
-                                  credId={cred.id}
-                                  depth={0}
-                                  selectedIds={selectedIds}
-                                  toggleProject={toggleProject}
-                                />
-                              ))
-                            ) : (availableProjects[cred.id] || []).length > 0 ? (
-                              (availableProjects[cred.id] || []).map((project) => {
-                                const rawSel = selectedIds[cred.id];
-                                const treeSel = projectTrees[cred.id]
-                                  ? expandToLeafSelection(projectTrees[cred.id], rawSel ?? null)
-                                  : (rawSel as number[] | null);
-                                const isSelected =
-                                  treeSel === null ||
-                                  treeSel === undefined ||
-                                  treeSel.includes(project.groupId);
-                                return (
-                                  <label
-                                    key={project.groupId}
-                                    className={`flex items-center gap-3 p-2 rounded cursor-pointer transition-colors ${isSelected ? "bg-blue-50" : "hover:bg-gray-100"}`}
-                                  >
-                                    <input
-                                      type="checkbox"
-                                      checked={isSelected}
-                                      onChange={() => toggleProject(cred.id, project.groupId)}
-                                      className="h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
-                                    />
-                                    <div className="flex-1 min-w-0">
-                                      <span className="text-sm font-medium text-gray-900">
-                                        {project.name}
-                                      </span>
-                                      <span className="text-xs text-gray-500 ml-2">
-                                        {project.type} &middot; ID: {project.groupId}
-                                      </span>
-                                    </div>
-                                  </label>
-                                );
-                              })
-                            ) : (
-                              <p className="text-sm text-gray-500 text-center py-4">
-                                No projects found for this credential
-                              </p>
-                            )}
-                          </div>
-
-                          <p className="text-xs text-gray-400 mt-3">
-                            {selectedIds[cred.id] === null || selectedIds[cred.id] === undefined
-                              ? "All projects are selected (default)"
-                              : (() => {
-                                  const tree = projectTrees[cred.id];
-                                  const expanded = tree
-                                    ? expandToLeafSelection(tree, selectedIds[cred.id]!)
-                                    : selectedIds[cred.id];
-                                  const leafTotal = tree
-                                    ? collectLeafIds(tree).length
-                                    : (availableProjects[cred.id] || []).length;
-                                  if (expanded === null) {
-                                    return "All projects are selected (default)";
-                                  }
-                                  return `${expanded.length} of ${leafTotal} leaf projects selected`;
-                                })()}
-                          </p>
-
-                          {/* Shared/received projects checklist */}
-                          {(sharedProjects[cred.id] || []).length > 0 && (
-                            <div className="mt-5 pt-4 border-t border-gray-200">
-                              <div className="flex items-center justify-between mb-3">
-                                <div>
-                                  <h4 className="text-sm font-medium text-gray-700">
-                                    Shared projects to monitor
-                                  </h4>
-                                  <p className="text-xs text-gray-400 mt-0.5">
-                                    Projects shared with this account
-                                  </p>
-                                </div>
-                                <div className="flex gap-2">
-                                  <button
-                                    onClick={() => selectAllShared(cred.id)}
-                                    className="text-xs text-blue-600 hover:underline"
-                                  >
-                                    Select All
-                                  </button>
-                                  <button
-                                    onClick={() => deselectAllShared(cred.id)}
-                                    className="text-xs text-red-600 hover:underline"
-                                  >
-                                    Deselect All
-                                  </button>
-                                </div>
-                              </div>
-
-                              <div className="space-y-1">
-                                {(sharedProjects[cred.id] || []).map((sp) => {
-                                  const isSelected = isSharedSelected(cred.id, sp.groupId);
-                                  return (
-                                    <label
-                                      key={sp.groupId}
-                                      className={`flex items-center gap-3 p-2 rounded cursor-pointer transition-colors ${isSelected ? "bg-purple-50" : "hover:bg-gray-100"}`}
-                                    >
-                                      <input
-                                        type="checkbox"
-                                        checked={isSelected}
-                                        onChange={() => toggleSharedProject(cred.id, sp.groupId)}
-                                        className="h-4 w-4 text-purple-600 rounded border-gray-300 focus:ring-purple-500"
-                                      />
-                                      <div className="flex-1 min-w-0">
-                                        <span className="text-sm font-medium text-gray-900">
-                                          {sp.name}
-                                        </span>
-                                        <span className="text-xs text-gray-500 ml-2">
-                                          SHARED &middot; ID: {sp.groupId}
-                                          {sp.totalCount > 0 && ` \u00B7 ${sp.totalCount} devices`}
-                                        </span>
-                                      </div>
-                                      {sp.tenantName && (
-                                        <span className="text-xs text-purple-500 shrink-0">
-                                          {sp.tenantName}
-                                        </span>
-                                      )}
-                                    </label>
-                                  );
-                                })}
-                              </div>
-
-                              <p className="text-xs text-gray-400 mt-3">
-                                {getSharedSelectionLabel(cred.id)}
-                              </p>
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
                 </div>
               ))
             )}
           </div>
         </div>
+        )}
       </div>
+      <Modal
+        open={showForm}
+        title="Add Credential"
+        onClose={() => {
+          setShowForm(false);
+          setError("");
+        }}
+      >
+        <form onSubmit={handleAdd} className="space-y-4">
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded text-sm">{error}</div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Name *</label>
+              <input type="text" required value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} placeholder="e.g., Main Account" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700">App ID *</label>
+              <input type="text" required value={formData.appId} onChange={(e) => setFormData({ ...formData, appId: e.target.value })} className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Secret *</label>
+              <input type="password" required value={formData.secret} onChange={(e) => setFormData({ ...formData, secret: e.target.value })} className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Bootstrap Token</label>
+              <input type="text" value={formData.bootstrapToken} onChange={(e) => setFormData({ ...formData, bootstrapToken: e.target.value })} placeholder="Default if empty" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
+            </div>
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium text-gray-700">Base URL</label>
+              <input type="text" value={formData.baseUrl} onChange={(e) => setFormData({ ...formData, baseUrl: e.target.value })} placeholder="https://cloud-as.ruijienetworks.com" className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-sm" />
+            </div>
+          </div>
+          <div className="flex justify-end gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                setShowForm(false);
+                setError("");
+              }}
+              className="px-4 py-2 text-sm font-medium text-gray-600 bg-transparent border border-gray-400 rounded-md hover:bg-gray-100"
+            >
+              Cancel
+            </button>
+            <button type="submit" disabled={saving} className="px-4 py-2 text-sm font-medium text-emerald-600 bg-transparent border border-emerald-600 rounded-md hover:bg-emerald-50 disabled:opacity-50">
+              {saving ? "Saving..." : "Save Credential"}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={projectsCred !== null}
+        title={`Projects — ${projectsCred?.name || ""}`}
+        onClose={() => setProjectsModalCredId(null)}
+        wide
+      >
+        {projectsCred &&
+          (() => {
+            const cred = projectsCred;
+            return (
+              <>
+                {loadingProjects === cred.id ? (
+                  <div className="text-center text-gray-500 py-8">Loading projects...</div>
+                ) : projectsError[cred.id] ? (
+                  <div className="text-center text-red-600 py-8">
+                    <p className="font-medium">Failed to load projects</p>
+                    <p className="text-sm mt-1">{projectsError[cred.id]}</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between mb-3">
+                      <div>
+                        <h4 className="text-sm font-medium text-gray-700">
+                          Select projects to monitor
+                        </h4>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          {projectsFetchedAt[cred.id]
+                            ? `Last synced ${new Date(projectsFetchedAt[cred.id]).toLocaleString()}`
+                            : "Not synced yet — run Sync devices to refresh the project list"}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={() => selectAll(cred.id)} className="text-xs font-medium text-blue-600 bg-transparent border border-blue-600 hover:bg-blue-50 rounded px-2 py-1">
+                          Select All
+                        </button>
+                        <button onClick={() => deselectAll(cred.id)} className="text-xs font-medium text-red-600 bg-transparent border border-red-600 hover:bg-red-50 rounded px-2 py-1">
+                          Deselect All
+                        </button>
+                        <button onClick={() => saveProjectSelection(cred.id)} disabled={savingProjects === cred.id} className="px-3 py-1 text-xs font-medium text-green-600 bg-transparent border border-green-600 rounded hover:bg-green-50 disabled:opacity-50">
+                          {savingProjects === cred.id ? "Saving..." : "Save Selection"}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1">
+                      {(projectTrees[cred.id] || []).length > 0 ? (
+                        (projectTrees[cred.id] || []).map((node) => (
+                          <TreeNodeRow
+                            key={node.groupId}
+                            node={node}
+                            credId={cred.id}
+                            depth={0}
+                            selectedIds={selectedIds}
+                            toggleProject={toggleProject}
+                          />
+                        ))
+                      ) : (availableProjects[cred.id] || []).length > 0 ? (
+                        (availableProjects[cred.id] || []).map((project) => {
+                          const rawSel = selectedIds[cred.id];
+                          const treeSel = projectTrees[cred.id]
+                            ? expandToLeafSelection(projectTrees[cred.id], rawSel ?? null)
+                            : (rawSel as number[] | null);
+                          const isSelected =
+                            treeSel === null ||
+                            treeSel === undefined ||
+                            treeSel.includes(project.groupId);
+                          return (
+                            <label
+                              key={project.groupId}
+                              className={`flex items-center gap-3 p-2 rounded cursor-pointer transition-colors ${isSelected ? "bg-blue-50" : "hover:bg-gray-100"}`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => toggleProject(cred.id, project.groupId)}
+                                className="h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                              />
+                              <div className="flex-1 min-w-0">
+                                <span className="text-sm font-medium text-gray-900">
+                                  {project.name}
+                                </span>
+                                <span className="text-xs text-gray-500 ml-2">
+                                  {project.type} &middot; ID: {project.groupId}
+                                </span>
+                              </div>
+                            </label>
+                          );
+                        })
+                      ) : (
+                        <p className="text-sm text-gray-500 text-center py-4">
+                          No projects found for this credential
+                        </p>
+                      )}
+                    </div>
+
+                    <p className="text-xs text-gray-400 mt-3">
+                      {selectedIds[cred.id] === null || selectedIds[cred.id] === undefined
+                        ? "All projects are selected (default)"
+                        : (() => {
+                            const tree = projectTrees[cred.id];
+                            const expanded = tree
+                              ? expandToLeafSelection(tree, selectedIds[cred.id]!)
+                              : selectedIds[cred.id];
+                            const leafTotal = tree
+                              ? collectLeafIds(tree).length
+                              : (availableProjects[cred.id] || []).length;
+                            if (expanded === null) {
+                              return "All projects are selected (default)";
+                            }
+                            return `${expanded.length} of ${leafTotal} leaf projects selected`;
+                          })()}
+                    </p>
+
+                    {/* Shared/received projects checklist */}
+                    {(sharedProjects[cred.id] || []).length > 0 && (
+                      <div className="mt-5 pt-4 border-t border-gray-200">
+                        <div className="flex items-center justify-between mb-3">
+                          <div>
+                            <h4 className="text-sm font-medium text-gray-700">
+                              Shared projects to monitor
+                            </h4>
+                            <p className="text-xs text-gray-400 mt-0.5">
+                              Projects shared with this account
+                            </p>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => selectAllShared(cred.id)}
+                              className="text-xs font-medium text-blue-600 bg-transparent border border-blue-600 hover:bg-blue-50 rounded px-2 py-1"
+                            >
+                              Select All
+                            </button>
+                            <button
+                              onClick={() => deselectAllShared(cred.id)}
+                              className="text-xs font-medium text-red-600 bg-transparent border border-red-600 hover:bg-red-50 rounded px-2 py-1"
+                            >
+                              Deselect All
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          {(sharedProjects[cred.id] || []).map((sp) => {
+                            const isSelected = isSharedSelected(cred.id, sp.groupId);
+                            return (
+                              <label
+                                key={sp.groupId}
+                                className={`flex items-center gap-3 p-2 rounded cursor-pointer transition-colors ${isSelected ? "bg-purple-50" : "hover:bg-gray-100"}`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={() => toggleSharedProject(cred.id, sp.groupId)}
+                                  className="h-4 w-4 text-purple-600 rounded border-gray-300 focus:ring-purple-500"
+                                />
+                                <div className="flex-1 min-w-0">
+                                  <span className="text-sm font-medium text-gray-900">
+                                    {sp.name}
+                                  </span>
+                                  <span className="text-xs text-gray-500 ml-2">
+                                    SHARED &middot; ID: {sp.groupId}
+                                    {sp.totalCount > 0 && ` \u00B7 ${sp.totalCount} devices`}
+                                  </span>
+                                </div>
+                                {sp.tenantName && (
+                                  <span className="text-xs text-purple-500 shrink-0">
+                                    {sp.tenantName}
+                                  </span>
+                                )}
+                              </label>
+                            );
+                          })}
+                        </div>
+
+                        <p className="text-xs text-gray-400 mt-3">
+                          {getSharedSelectionLabel(cred.id)}
+                        </p>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            );
+          })()}
+      </Modal>
+
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+      <ConfirmModal
+        dialog={confirmDialog}
+        onCancel={() => setConfirmDialog(null)}
+      />
     </div>
   );
 }

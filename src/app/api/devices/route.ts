@@ -42,7 +42,8 @@ export async function GET(request: NextRequest) {
     let query = supabase
       .from("api_credentials")
       .select("*")
-      .eq("user_id", user.id);
+      .eq("user_id", user.id)
+      .eq("is_active", true);
 
     if (credentialId) {
       query = query.eq("id", credentialId);

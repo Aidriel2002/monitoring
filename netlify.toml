@@ -1,0 +1,27 @@
+# Netlify deployment for the Next.js monitoring dashboard.
+#
+# This app is NOT a static site: it has API routes, cookie-based auth and
+# server-side Supabase/Telegram/Ruijie calls. A dragged-and-dropped "build
+# folder" cannot work — Netlify must build it from source and run it with
+# the Next.js runtime (API routes become serverless functions).
+#
+# Required environment variables (Site settings → Environment variables —
+# .env.local is gitignored and never uploaded):
+#   NEXT_PUBLIC_SUPABASE_URL
+#   NEXT_PUBLIC_SUPABASE_ANON_KEY
+#   SUPABASE_SERVICE_ROLE_KEY
+#   TELEGRAM_BOT_TOKEN          (optional — enables outage reports)
+
+[build]
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  # Fresh dashboard rebuilds (Ruijie pagination + geocoding) exceed Netlify's
+  # 10s default timeout; 26s is the maximum standard timeout.
+  timeout = 26
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"

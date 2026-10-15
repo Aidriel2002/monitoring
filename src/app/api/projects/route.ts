@@ -48,7 +48,17 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: credsError.message }, { status: 500 });
     }
 
-    if (!creds || creds.length === 0) {
+    if (credentialId && (creds || []).some((c) => c.is_active === false)) {
+      return NextResponse.json(
+        { error: "Credential is disabled — enable it in Settings first." },
+        { status: 400 }
+      );
+    }
+
+    // Disabled credentials are never queried — they would only burn quota.
+    const activeCreds = (creds || []).filter((c) => c.is_active !== false);
+
+    if (activeCreds.length === 0) {
       return NextResponse.json({
         projects: [],
         message: "No credentials configured. Add credentials in Settings.",
@@ -59,7 +69,7 @@ export async function GET(request: Request) {
     const allProjects = [];
     const errors = [];
 
-    for (const cred of creds) {
+    for (const cred of activeCreds) {
       try {
         const credentials: RuijieCredentials = {
           appId: cred.app_id,

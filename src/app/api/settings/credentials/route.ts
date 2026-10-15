@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
+import { cacheClear } from "@/lib/cache";
 import { expandSelectionToLeaves, fetchProjectTree } from "@/lib/ruijie";
 
 async function getUser(request: Request) {
@@ -48,6 +49,8 @@ export async function GET(request: Request) {
         if (cred.selected_group_ids === null || cred.selected_group_ids === undefined) {
           return pub;
         }
+        // Disabled credentials are never called — no tree expansion either.
+        if (cred.is_active === false) return pub;
         try {
           const { tree } = await fetchProjectTree({
             appId: cred.app_id as string,
@@ -113,6 +116,50 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json({ credential: data });
+  } catch {
+    return NextResponse.json(
+      { error: "Internal server error" },
+      { status: 500 }
+    );
+  }
+}
+
+export async function PATCH(request: Request) {
+  try {
+    const user = await getUser(request);
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { id, isActive } = await request.json();
+
+    if (!id || typeof isActive !== "boolean") {
+      return NextResponse.json(
+        { error: "id and isActive are required" },
+        { status: 400 }
+      );
+    }
+
+    const supabase = getSupabaseServiceRole();
+    const { data, error } = await supabase
+      .from("api_credentials")
+      .update({ is_active: isActive })
+      .eq("id", id)
+      .eq("user_id", user.id)
+      .select("id, name, is_active")
+      .single();
+
+    if (error || !data) {
+      return NextResponse.json(
+        { error: error?.message || "Credential not found" },
+        { status: 404 }
+      );
+    }
+
+    // A disabled credential must disappear from the dashboard immediately.
+    cacheClear(`dashboard:${user.id}`);
+
+    return NextResponse.json({ success: true, isActive: data.is_active });
   } catch {
     return NextResponse.json(
       { error: "Internal server error" },

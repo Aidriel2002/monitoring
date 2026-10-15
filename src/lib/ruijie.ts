@@ -7,6 +7,7 @@ import {
   CacheFetchResult,
 } from "@/lib/cache";
 import { diskGet, diskSet, diskDelete } from "@/lib/disk-cache";
+import { isValidSiteGeo } from "@/lib/geo";
 import { appendFileSync, existsSync } from "node:fs";
 import nodePath from "node:path";
 
@@ -490,13 +491,25 @@ export async function getGroupGeo(
 ): Promise<GroupGeo> {
   const key = `group-geo:v1:${credKey(creds)}:${groupId}`;
 
+  // (0,0) / swapped lat-lng answers cached by older builds are unusable —
+  // drop them so this call refetches instead of serving the same bad point.
+  const geoUsable = (v: GroupGeo) =>
+    (v.latitude == null && v.longitude == null) ||
+    isValidSiteGeo(v.latitude, v.longitude);
+
   const mem = cacheGet<GroupGeo>(key);
-  if (mem) return mem;
+  if (mem) {
+    if (geoUsable(mem)) return mem;
+    cacheClear(key);
+  }
 
   const disk = diskGet<GroupGeo>(key);
   if (disk !== undefined) {
-    cacheSet(key, disk, TTL_TREE_MS);
-    return disk;
+    if (geoUsable(disk)) {
+      cacheSet(key, disk, TTL_TREE_MS);
+      return disk;
+    }
+    diskDelete(key);
   }
 
   const { value, stale } = await cacheFetchDetailed<GroupGeo>(
@@ -512,9 +525,12 @@ export async function getGroupGeo(
         return {};
       }
       const { latitude, longitude } = data.groups;
+      // Never cache (0,0) or swapped lat/lng — the dashboard falls back
+      // to place-name geocoding when the group answer is unusable.
+      if (!isValidSiteGeo(latitude, longitude)) return {};
       return {
-        latitude: typeof latitude === "number" ? latitude : undefined,
-        longitude: typeof longitude === "number" ? longitude : undefined,
+        latitude,
+        longitude,
       };
     }
   );

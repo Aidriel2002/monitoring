@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
-import { cacheFetch, cacheClear } from "@/lib/cache";
+import { cacheFetch, cacheClear, cacheGet, cacheSet } from "@/lib/cache";
+import { diskGet, diskSet } from "@/lib/disk-cache";
 import {
   getProjects,
   fetchProjectTree,
@@ -18,8 +19,9 @@ import {
   RuijieDevice,
   RuijieWarnLog,
 } from "@/lib/ruijie";
-import { reverseGeocodeProvince, geocodeSiteName } from "@/lib/geo";
+import { reverseGeocodeProvince, geocodeSiteName, isValidSiteGeo } from "@/lib/geo";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
+import { processTelegramInbox, sendOfflineReports } from "@/lib/notify";
 
 /** Healthy payload matches the 100m status cycle; limited/degraded re-seat to 15s. */
 const DASHBOARD_TTL_MS = DEVICE_STATUS_INTERVAL_SECONDS * 1000;
@@ -39,6 +41,44 @@ const warnLogsByGroup = new Map<
   number,
   { rows: RuijieWarnLog[]; fetchedAt: number; offlineCount: number }
 >();
+
+/**
+ * Outage starts for sites with no readable per-device history: shared
+ * projects from tenants this account cannot query (device list → code 5,
+ * warn log → empty) only expose on/off counts, never a timestamp. Remember
+ * when the outage was first observed instead — persisted so restarts and
+ * rate-limit holds don't reset every site's offline-days clock.
+ */
+const OUTAGE_DISK_KEY = "outage-starts:v1";
+/** An entry unseen for this long is treated as a closed, previous outage. */
+const OUTAGE_ENTRY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const outageStarts = new Map<
+  number,
+  { startedAt: number; lastSeenAt: number }
+>();
+let outageStartsLoaded = false;
+
+function loadOutageStarts(): void {
+  if (outageStartsLoaded) return;
+  outageStartsLoaded = true;
+  try {
+    const rows = diskGet<[number, { startedAt: number; lastSeenAt: number }][]>(
+      OUTAGE_DISK_KEY
+    );
+    if (rows) for (const [groupId, entry] of rows) outageStarts.set(groupId, entry);
+  } catch {
+    // unreadable entry — start empty; the next build re-seeds it
+  }
+}
+
+/** Oldest known outage start from real device rows (0 = no data). */
+function oldestOfflineFromDevices(devices: RuijieDevice[]): number {
+  const times = devices
+    .filter((d) => d.onlineStatus !== "ON" && d.lastOnline > 0)
+    .map((d) => d.lastOnline);
+  if (times.length === 0) return 0;
+  return Math.min(...times);
+}
 
 export interface RateLimitedCredential {
   id: string;
@@ -69,6 +109,12 @@ export interface ProjectWithDevices extends RuijieProject {
   offlineCount: number;
   totalCount: number;
   credentialId?: string;
+  /**
+   * When this site went offline (epoch ms). Normally the oldest offline
+   * device's `lastOnline`; for shared projects whose device history this
+   * account cannot read, the first build that saw the outage.
+   */
+  oldestOffline?: number;
 }
 
 export type OfflineDevice = RuijieDevice & {
@@ -165,9 +211,26 @@ export async function GET(request: Request) {
       });
     }
 
+    const cacheKey = `dashboard:${user.id}`;
+    // Every credential in this account shares one Ruijie quota (same bootstrap
+    // key, same source IP): once one of them returns code 44, calling the
+    // others only earns code 44 for them too — which is how all of them ended
+    // up flagged at once. While a cooldown is active, hold the rebuild: the
+    // last payload keeps every other credential's projects on screen and only
+    // the credential that actually hit the limit is reported.
+    const coolingCred = creds.some((cred) =>
+      getRateLimitStatus(toRuijieCreds(cred)).limited
+    );
+    // Read before any cacheClear below so a forced rebuild can still fall back
+    // to the previous payload if the shared quota runs out mid-build.
+    const cached = cacheGet<DashboardPayload>(cacheKey);
+
     // Refresh button: reset the 100m status window and rebuild immediately.
+    // Not while cooling down — there is nothing to refresh, the calls would
+    // only earn more code 44s (Sync Data falls back to the last payload).
     const forceStatus =
-      new URL(request.url).searchParams.get("refresh") === "status";
+      new URL(request.url).searchParams.get("refresh") === "status" &&
+      !coolingCred;
     if (forceStatus) {
       for (const cred of creds) {
         invalidateDeviceStatus({
@@ -177,39 +240,83 @@ export async function GET(request: Request) {
           baseUrl: cred.base_url || undefined,
         });
       }
-      cacheClear(`dashboard:${user.id}`);
+      cacheClear(cacheKey);
     }
 
     // One shared payload per user — concurrent tab polls hit memory, not Ruijie.
     // Degraded / rate-limited results get a short TTL so they self-heal.
-    const payload = await cacheFetch(
-      `dashboard:${user.id}`,
-      DASHBOARD_TTL_MS,
-      async () => {
-        const built = await buildDashboard(creds, { forceGeo: forceStatus });
-        // Push fresh data (and limit flags) to open dashboards without waiting
-        // for the client's poll — realtime costs no Ruijie quota.
-        void broadcastDashboardUpdate(user.id, {
-          rateLimitedCredentials: built.rateLimitedCredentials,
-          degraded: built.degraded,
-        });
-        return built;
-      }
-    );
+    const payload =
+      coolingCred && cached
+        ? cached
+        : await cacheFetch(cacheKey, DASHBOARD_TTL_MS, async () => {
+            const built = await buildDashboard(creds, {
+              forceGeo: forceStatus,
+              prev: cached,
+            });
+            // Push fresh data (and limit flags) to open dashboards without waiting
+            // for the client's poll — realtime costs no Ruijie quota. Awaited so
+            // serverless hosts (Netlify) don't freeze it after the response.
+            await broadcastDashboardUpdate(user.id, {
+              rateLimitedCredentials: built.rateLimitedCredentials,
+              degraded: built.degraded,
+            });
+            // Telegram outage report to contact incharges — runs only on fresh
+            // rebuilds: the 100-min TTL expiry and manual Sync Data. Awaited
+            // (bounded by Telegram timeouts) so serverless hosts cannot kill
+            // it after the response is written.
+            await sendOfflineReports(user.id, built).catch((e) =>
+              console.warn(
+                "Offline notifications failed:",
+                e instanceof Error ? e.message : e
+              )
+            );
+            return built;
+          });
 
     // Overlay live cooldown state on every response — even when the dashboard
     // cache still holds a "healthy" payload from before code 44.
     const response = applyLiveRateLimits(payload, creds);
 
+    // Payloads cached before coordinate validation may still carry bogus
+    // coords — strip them on the way out so the map never plots them.
+    for (const p of response.projects) {
+      if (
+        p.latitude != null &&
+        p.longitude != null &&
+        !isValidSiteGeo(p.latitude, p.longitude)
+      ) {
+        p.latitude = undefined;
+        p.longitude = undefined;
+      }
+    }
+    for (const d of response.offlineDevices) {
+      if (
+        d.latitude != null &&
+        d.longitude != null &&
+        !isValidSiteGeo(d.latitude, d.longitude)
+      ) {
+        d.latitude = undefined;
+        d.longitude = undefined;
+      }
+    }
+
     const ttl =
       response.degraded || response.rateLimitedCredentials.length > 0
         ? 15_000
         : DASHBOARD_TTL_MS;
-    // Re-seat TTL for degraded/limited payloads (cacheFetch already stored full TTL).
+    // Re-seat TTL for degraded/limited payloads (cacheFetch already stored full TTL)
+    // — also while holding the rebuild, so the next request after the cooldown
+    // expires rebuilds instead of serving stale data for another status cycle.
     if (ttl < DASHBOARD_TTL_MS) {
-      const { cacheSet } = await import("@/lib/cache");
-      cacheSet(`dashboard:${user.id}`, response, ttl);
+      cacheSet(cacheKey, response, ttl);
     }
+
+    // Bot inbox housekeeping: link phone numbers and reply to new chats so
+    // the bot responds within ~a minute of being messaged. Throttled inside
+    // (one scan per minute). Awaited (not fire-and-forget) so serverless
+    // hosts don't freeze it after the response is written; the throttle
+    // keeps the extra latency to ~one scan per minute per instance.
+    await processTelegramInbox().catch(() => undefined);
 
     return NextResponse.json({
       ...response,
@@ -234,7 +341,22 @@ type CredentialRow = {
   selected_received_group_ids: number[] | null;
 };
 
-type DashboardPayload = Awaited<ReturnType<typeof buildDashboard>>;
+function toRuijieCreds(cred: CredentialRow): RuijieCredentials {
+  return {
+    appId: cred.app_id,
+    secret: cred.secret,
+    bootstrapToken: cred.bootstrap_token || undefined,
+    baseUrl: cred.base_url || undefined,
+  };
+}
+
+interface DashboardPayload {
+  projects: ProjectWithDevices[];
+  offlineDevices: OfflineDevice[];
+  offlineSites: ProjectWithDevices[];
+  rateLimitedCredentials: RateLimitedCredential[];
+  degraded: boolean;
+}
 
 /**
  * Merge in-memory cooldown state into a (possibly cached) dashboard payload
@@ -247,12 +369,7 @@ function applyLiveRateLimits(
   const rateLimitedCredentials: RateLimitedCredential[] = [];
 
   for (const cred of creds) {
-    const status = getRateLimitStatus({
-      appId: cred.app_id,
-      secret: cred.secret,
-      bootstrapToken: cred.bootstrap_token || undefined,
-      baseUrl: cred.base_url || undefined,
-    });
+    const status = getRateLimitStatus(toRuijieCreds(cred));
     if (status.limited) {
       rateLimitedCredentials.push({
         id: cred.id,
@@ -292,11 +409,14 @@ function applyLiveRateLimits(
 
 async function buildDashboard(
   creds: CredentialRow[],
-  opts?: { forceGeo?: boolean }
-) {
+  opts?: { forceGeo?: boolean; prev?: DashboardPayload }
+): Promise<DashboardPayload> {
     const allProjects: ProjectWithDevices[] = [];
     const allOfflineDevices: OfflineDevice[] = [];
     let degraded = false;
+    // A fresh code 44 on the shared quota: stop calling Ruijie for the rest of
+    // this build so the remaining credentials are not flagged as limited too.
+    let quotaHit = false;
     const rateLimitedCredentials: RateLimitedCredential[] = [];
 
     const markLimited = (cred: CredentialRow, retryInSeconds: number) => {
@@ -313,12 +433,7 @@ async function buildDashboard(
     // a rate limit hit during a previous request must show even if caches
     // would otherwise serve a full healthy payload.
     for (const cred of creds) {
-      const status = getRateLimitStatus({
-        appId: cred.app_id,
-        secret: cred.secret,
-        bootstrapToken: cred.bootstrap_token || undefined,
-        baseUrl: cred.base_url || undefined,
-      });
+      const status = getRateLimitStatus(toRuijieCreds(cred));
       if (status.limited) markLimited(cred, status.retryInSeconds);
     }
 
@@ -336,13 +451,6 @@ async function buildDashboard(
       }
     };
 
-    const toRuijieCreds = (cred: CredentialRow): RuijieCredentials => ({
-      appId: cred.app_id,
-      secret: cred.secret,
-      bootstrapToken: cred.bootstrap_token || undefined,
-      baseUrl: cred.base_url || undefined,
-    });
-
     // Shared sites live under a sharing credential that cannot read
     // `GET /group/{id}` (code 5). Seed coords from every owned tree first
     // so reverse-geocode still gets lat/lng when the owner is also linked.
@@ -352,6 +460,7 @@ async function buildDashboard(
     >();
     const ownedGroupIds = new Set<number>();
     for (const cred of creds) {
+      if (quotaHit) break;
       const credentials = toRuijieCreds(cred);
       if (getRateLimitStatus(credentials).limited) continue;
       try {
@@ -367,6 +476,7 @@ async function buildDashboard(
       } catch (e) {
         if (isRateLimitError(e)) {
           markLimited(cred, getRateLimitStatus(credentials).retryInSeconds || 30);
+          quotaHit = true;
         }
         // Tree unavailable — per-credential getGroupGeo still runs below.
       }
@@ -379,6 +489,7 @@ async function buildDashboard(
     const fleetByGroup = new Map<number, RuijieDevice[]>();
     const fleetByCred = new Map<string, RuijieDevice[]>();
     for (const cred of creds) {
+      if (quotaHit) break;
       const credentials = toRuijieCreds(cred);
       if (getRateLimitStatus(credentials).limited) continue;
       let fleet: RuijieDevice[] = [];
@@ -388,6 +499,7 @@ async function buildDashboard(
         if (isRateLimitError(e)) {
           const st = getRateLimitStatus(credentials);
           markLimited(cred, st.retryInSeconds || 30);
+          quotaHit = true;
           dropLimitedProjects();
           continue;
         }
@@ -407,9 +519,12 @@ async function buildDashboard(
     // device identity. The global warnlog list is capped (5 pages), so groups
     // deep in history never appear in it; `group_id` scopes the query.
     // Reuse/refresh policy lives with the module-scope `warnLogsByGroup`.
+    // `preferCredId` is the credential that received the project — it is the
+    // one that can see its alarms, so it usually answers on the first try.
     const loadWarnLogsForGroup = async (
       groupId: number,
-      offlineCount: number
+      offlineCount: number,
+      preferCredId?: string
     ): Promise<RuijieWarnLog[]> => {
       const hit = warnLogsByGroup.get(groupId);
       if (
@@ -420,9 +535,17 @@ async function buildDashboard(
         return hit.rows;
       }
 
+      const ordered = preferCredId
+        ? [
+            ...creds.filter((c) => c.id === preferCredId),
+            ...creds.filter((c) => c.id !== preferCredId),
+          ]
+        : creds;
+
       let rows: RuijieWarnLog[] = [];
       let answered = false;
-      for (const c of creds) {
+      for (const c of ordered) {
+        if (quotaHit) break;
         const credentials = toRuijieCreds(c);
         if (getRateLimitStatus(credentials).limited) continue;
         try {
@@ -432,6 +555,7 @@ async function buildDashboard(
           if (isRateLimitError(e)) {
             const st = getRateLimitStatus(credentials);
             markLimited(c, st.retryInSeconds || 30);
+            quotaHit = true;
             continue;
           }
           continue; // try next credential
@@ -452,12 +576,9 @@ async function buildDashboard(
     };
 
     for (const cred of creds) {
-      const credentials: RuijieCredentials = {
-        appId: cred.app_id,
-        secret: cred.secret,
-        bootstrapToken: cred.bootstrap_token || undefined,
-        baseUrl: cred.base_url || undefined,
-      };
+      if (quotaHit) break;
+
+      const credentials: RuijieCredentials = toRuijieCreds(cred);
 
       // Already cooling down — skip all Ruijie calls; hide this account's projects.
       const preStatus = getRateLimitStatus(credentials);
@@ -466,11 +587,18 @@ async function buildDashboard(
         continue;
       }
 
-      // Fetch received/shared projects (1 API call, already has device counts).
-      // Explicit empty selection owns no shared groups — skip the list call.
+      // A credential with no owned projects and no shared projects selected
+      // contributes nothing to the dashboard — never call Ruijie for it, so it
+      // cannot be rate-limited (or drag the shared quota down) either.
+      const ownedSel = cred.selected_group_ids as number[] | null;
       const receivedSel = cred.selected_received_group_ids as number[] | null;
+      const skipOwned = Array.isArray(ownedSel) && ownedSel.length === 0;
       const skipReceived =
         Array.isArray(receivedSel) && receivedSel.length === 0;
+      if (skipOwned && skipReceived) continue;
+
+      // Fetch received/shared projects (1 API call, already has device counts).
+      // Explicit empty selection owns no shared groups — skip the list call.
       try {
         const receivedAll = skipReceived
           ? []
@@ -502,7 +630,11 @@ async function buildDashboard(
           if (offlineCount > 0) {
             devices = fleetByGroup.get(rp.groupId) || [];
             if (devices.length === 0) {
-              const logs = await loadWarnLogsForGroup(rp.groupId, offlineCount);
+              const logs = await loadWarnLogsForGroup(
+                rp.groupId,
+                offlineCount,
+                cred.id
+              );
               devices = warnLogsToDevices(logs, rp.groupId, offlineCount);
               devicesFromWarnLog = devices.length > 0;
             }
@@ -610,6 +742,7 @@ async function buildDashboard(
         if (isRateLimitError(e)) {
           const st = getRateLimitStatus(credentials);
           markLimited(cred, st.retryInSeconds || 30);
+          quotaHit = true;
           dropLimitedProjects();
           continue;
         }
@@ -692,6 +825,7 @@ async function buildDashboard(
         if (isRateLimitError(e)) {
           const st = getRateLimitStatus(credentials);
           markLimited(cred, st.retryInSeconds || 30);
+          quotaHit = true;
           dropLimitedProjects();
           continue;
         }
@@ -700,20 +834,34 @@ async function buildDashboard(
       }
     }
 
+    // Shared quota exhausted mid-build: stop here and hand back the previous
+    // payload. The remaining credentials never got a 44 of their own, so they
+    // are neither flagged nor hidden — their last known projects stay up.
+    if (quotaHit && opts?.prev) return opts.prev;
+
     // Codes 44 can be swallowed by stale-on-error inside cacheFetch —
     // re-check every credential's cooldown so the banner still appears.
     for (const cred of creds) {
-      const status = getRateLimitStatus({
-        appId: cred.app_id,
-        secret: cred.secret,
-        bootstrapToken: cred.bootstrap_token || undefined,
-        baseUrl: cred.base_url || undefined,
-      });
+      const status = getRateLimitStatus(toRuijieCreds(cred));
       if (status.limited) markLimited(cred, status.retryInSeconds);
     }
 
     // Final pass — hide any leftover rows for credentials that hit their limit.
     dropLimitedProjects();
+
+    // Reject bogus site coordinates (0,0, swapped lat/lng, foreign hits)
+    // before they are plotted: clear them so the group-geo and name-geocode
+    // passes below get a chance to place the site correctly.
+    for (const p of allProjects) {
+      if (
+        p.latitude != null &&
+        p.longitude != null &&
+        !isValidSiteGeo(p.latitude, p.longitude)
+      ) {
+        p.latitude = undefined;
+        p.longitude = undefined;
+      }
+    }
 
     // Last-chance coords for sites still missing lat/lng (e.g. shared from a
     // tenant we do not own and not present in any linked owned tree).
@@ -734,7 +882,7 @@ async function buildDashboard(
         if (getRateLimitStatus(credentials).limited) continue;
         try {
           const geo = await getGroupGeo(credentials, p.groupId);
-          if (geo.latitude != null && geo.longitude != null) {
+          if (isValidSiteGeo(geo.latitude, geo.longitude)) {
             p.latitude = geo.latitude;
             p.longitude = geo.longitude;
             break;
@@ -793,6 +941,50 @@ async function buildDashboard(
       }
       const owner = allProjects.find((p) => p.groupId === d.groupId);
       if (owner?.province && !d.province) d.province = owner.province;
+    }
+
+    // Offline day / time: sites with readable devices take it from their
+    // oldest device's lastOnline. Shared projects from tenants this account
+    // cannot query expose only counts — device list → code 5, warn log →
+    // empty — so fall back to the first build that observed the outage.
+    // Persisted (24h freshness) so restarts and rate-limit holds don't reset
+    // every shared site's offline-days clock.
+    loadOutageStarts();
+    const observedAt = Date.now();
+    let outageDirty = false;
+    for (const p of allProjects) {
+      if (p.totalCount <= 0) continue;
+      if (p.offlineCount <= 0) {
+        if (outageStarts.delete(p.groupId)) outageDirty = true;
+        continue;
+      }
+      const derived = oldestOfflineFromDevices(p.devices);
+      if (derived > 0) {
+        const known = outageStarts.get(p.groupId)?.startedAt;
+        outageStarts.set(p.groupId, {
+          startedAt: known && known < derived ? known : derived,
+          lastSeenAt: observedAt,
+        });
+        p.oldestOffline = derived;
+      } else {
+        const known = outageStarts.get(p.groupId);
+        const startedAt =
+          known && observedAt - known.lastSeenAt < OUTAGE_ENTRY_MAX_AGE_MS
+            ? known.startedAt
+            : observedAt;
+        outageStarts.set(p.groupId, { startedAt, lastSeenAt: observedAt });
+        p.oldestOffline = startedAt;
+      }
+      outageDirty = true;
+    }
+    if (outageDirty) diskSet(OUTAGE_DISK_KEY, [...outageStarts]);
+
+    // Aggregate-only shared rows inherit the site's outage start so the
+    // Offline Devices panel shows offline days / exact time like real rows.
+    for (const d of allOfflineDevices) {
+      if (!d.detailsUnavailable || d.lastOnline > 0) continue;
+      const owner = allProjects.find((p) => p.groupId === d.groupId);
+      if (owner?.oldestOffline) d.lastOnline = owner.oldestOffline;
     }
 
     // Sites = only projects that actually have devices. Root/sub-root

@@ -8,7 +8,7 @@ export default function Home() {
         <p className="text-lg text-gray-600 mb-8">Real-time monitoring for received projects</p>
         <Link
           href="/dashboard"
-          className="inline-flex items-center px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors"
+          className="inline-flex items-center px-6 py-3 text-blue-600 bg-transparent border border-blue-600 font-medium rounded-lg hover:bg-blue-50 transition-colors"
         >
           Go to Dashboard
         </Link>

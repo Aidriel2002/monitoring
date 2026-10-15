@@ -140,6 +140,21 @@ function inPh(lat: number, lng: number): boolean {
 }
 
 /**
+ * Plausible site coordinates: finite and inside the Philippines.
+ * Rejects bogus values Ruijie occasionally serves — (0,0), swapped
+ * lat/lng (lng ≈ 124 lands outside the box) — so they fall through to
+ * a better source instead of pinning the site in the ocean.
+ */
+export function isValidSiteGeo(
+  latitude: number | null | undefined,
+  longitude: number | null | undefined
+): boolean {
+  return (
+    latitude != null && longitude != null && inPh(latitude, longitude)
+  );
+}
+
+/**
  * Build place-name search queries from a Ruijie site label.
  * Strips org/facility noise, keeps a province hint from the prefix, and
  * prefers municipality tokens so Nominatim hits on query #1 when possible.
@@ -176,6 +191,14 @@ const PROVINCE_HINTS: Array<{
     bbox: [7.3, 123.5, 9.5, 125.5],
     /** Query scope for ambiguous tokens (Magsaysay, etc.). */
     region: "Northern Mindanao",
+  },
+  // Poona Piagapo (Lanao del Norte). The bare token "Poona" fuzzy-matches
+  // "Poon-a-Bayabao" in Lanao del Sur (~25 km off) — tight municipal bbox
+  // rejects it; verified centroid 8.1329, 124.1178.
+  {
+    re: /\bPOONA\b/i,
+    province: "Lanao del Norte",
+    bbox: [7.95, 123.9, 8.35, 124.45],
   },
 ];
 

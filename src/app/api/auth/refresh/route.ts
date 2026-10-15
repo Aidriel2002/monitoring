@@ -15,12 +15,6 @@ function parseCookies(request: Request): Record<string, string> {
   );
 }
 
-function clearAuthCookies(response: NextResponse) {
-  response.cookies.delete("sb-access-token");
-  response.cookies.delete("sb-refresh-token");
-  return response;
-}
-
 function setAuthCookies(
   response: NextResponse,
   accessToken: string,
@@ -49,9 +43,10 @@ export async function POST(request: Request) {
     const refreshToken = cookies["sb-refresh-token"];
 
     if (!refreshToken) {
-      return clearAuthCookies(
-        NextResponse.json({ error: "No refresh token" }, { status: 401 })
-      );
+      // Never delete auth cookies here — a failed refresh must not log the
+      // account out; the UI keeps the session and shows the expiry banner
+      // until the user clicks "Log in again" or Logout themselves.
+      return NextResponse.json({ error: "No refresh token" }, { status: 401 });
     }
 
     const supabase = getSupabaseServiceRole();
@@ -60,8 +55,9 @@ export async function POST(request: Request) {
     });
 
     if (error || !data.session) {
-      return clearAuthCookies(
-        NextResponse.json({ error: "Session refresh failed" }, { status: 401 })
+      return NextResponse.json(
+        { error: "Session refresh failed" },
+        { status: 401 }
       );
     }
 

@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import type { RefObject } from "react";
 import { useRouter } from "next/navigation";
 import { authFetch } from "@/lib/auth-fetch";
 import { getSupabase } from "@/lib/supabase";
+import DashboardMap, { MapSite } from "@/components/DashboardMap";
 import {
   DASHBOARD_CHANNEL_PREFIX,
   DASHBOARD_EVENT,
@@ -24,6 +26,8 @@ interface Project {
   latitude?: number;
   longitude?: number;
   province?: string;
+  /** Server-side outage start — used when device history is unavailable. */
+  oldestOffline?: number;
 }
 
 interface Device {
@@ -78,8 +82,46 @@ const NEXT_REFRESH_KEY = "dashboard:nextRefreshAt";
 const MANUAL_REFRESH_KEY = "dashboard:manualRefreshAt";
 /** Fallback countdown (seconds) until the server reports statusIntervalSeconds. */
 const DEFAULT_INTERVAL_SECONDS = 100 * 60;
+/** Re-check while a credential is cooling down — server answers from cache. */
+const FAST_POLL_SECONDS = 60;
 /** Manual Sync Data / spam guard: at most one force sync per minute. */
 const MANUAL_REFRESH_COOLDOWN_MS = 60_000;
+/** Sync-finished alarm: keep beeping for 8 minutes after the cycle ends. */
+const BEEP_DURATION_MS = 8 * 60_000;
+/** Pause between beeps inside the alarm window. */
+const BEEP_REPEAT_MS = 10_000;
+
+let audioCtx: AudioContext | null = null;
+
+/** Short "beep beep" via Web Audio — no audio asset needed. */
+function playBeep(): void {
+  try {
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === "suspended") void audioCtx.resume();
+    const start = audioCtx.currentTime + 0.02;
+    for (let i = 0; i < 2; i++) {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "square";
+      osc.frequency.value = 880;
+      const t = start + i * 0.25;
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + 0.2);
+    }
+  } catch {
+    // Autoplay policies may block audio until the first user gesture.
+  }
+}
 
 function readNextRefreshAt(): number | null {
   try {
@@ -153,20 +195,75 @@ function formatOfflineDays(lastOnline: number): string {
   return formatDowntime(lastOnline);
 }
 
-/** Exact last-seen moment, GMT+8 — matches the header clock. */
-function formatLastSeen(lastOnline: number): string {
+/** Compact last-seen moment for list rows (no timezone suffix). */
+function formatLastSeenShort(lastOnline: number): string {
   if (!lastOnline) return "";
-  return (
-    new Date(lastOnline).toLocaleString("en-US", {
-      timeZone: "Asia/Shanghai",
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: true,
-    }) + " GMT+8"
-  );
+  return new Date(lastOnline).toLocaleString("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  });
+}
+
+/** Accent color for an outage: red (long) → orange → amber (recent). */
+function outageSeverity(days: number): { border: string; text: string } {
+  if (!days) return { border: "border-gray-300", text: "text-gray-500" };
+  if (days >= 90) return { border: "border-red-500", text: "text-red-600" };
+  if (days >= 30) return { border: "border-orange-400", text: "text-orange-500" };
+  return { border: "border-amber-400", text: "text-amber-600" };
+}
+
+/** Scroll speed for the auto-scrolling offline lists (ms per 1px step). */
+const AUTO_SCROLL_INTERVAL_MS = 50;
+/** How long the auto-scroll rests after wrapping to the top. */
+const AUTO_SCROLL_PAUSE_MS = 3_000;
+
+/**
+ * Continuously scroll a list down 1px at a time; when it reaches the bottom
+ * it jumps back to the top, rests for 3 seconds, then keeps scrolling.
+ * Manual scrolling (wheel, touch, scrollbar drag) also pauses it for
+ * 3 seconds so the user can read.
+ */
+function useAutoScroll(ref: RefObject<HTMLElement | null>): void {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    let pausedUntil = 0;
+    let lastSetTop = el.scrollTop;
+
+    // Any scroll we didn't cause ourselves is a user interaction.
+    const onScroll = () => {
+      if (Math.abs(el.scrollTop - lastSetTop) > 2) {
+        pausedUntil = Date.now() + AUTO_SCROLL_PAUSE_MS;
+      }
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+
+    const id = window.setInterval(() => {
+      if (Date.now() < pausedUntil) return;
+      const max = el.scrollHeight - el.clientHeight;
+      if (max <= 1) return; // nothing to overflow-scroll
+      const next = el.scrollTop + 1;
+      if (next >= max) {
+        lastSetTop = 0;
+        el.scrollTo(0, 0); // reached bottom → loop to top
+        pausedUntil = Date.now() + AUTO_SCROLL_PAUSE_MS; // rest before resuming
+        return;
+      }
+      lastSetTop = next;
+      el.scrollTo(0, next);
+    }, AUTO_SCROLL_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(id);
+      el.removeEventListener("scroll", onScroll);
+    };
+  }, [ref]);
 }
 
 function getSiteOldestOffline(site: Project): number {
@@ -175,32 +272,70 @@ function getSiteOldestOffline(site: Project): number {
   const times = site.devices
     .filter((d) => d.onlineStatus !== "ON" && d.lastOnline > 0)
     .map((d) => d.lastOnline);
-  if (times.length === 0) return 0;
-  return Math.min(...times);
+  if (times.length > 0) return Math.min(...times);
+  // Shared projects whose device history is denied still carry the outage
+  // start the server tracked from aggregate counts.
+  return site.oldestOffline || 0;
 }
 
-/** Stable background color for a province name (badge after site name). */
-function provinceBadgeClass(province?: string): string {
-  if (!province) return "bg-gray-200 text-gray-700";
-  const palette = [
-    "bg-blue-100 text-blue-800",
-    "bg-emerald-100 text-emerald-800",
-    "bg-violet-100 text-violet-800",
-    "bg-amber-100 text-amber-800",
-    "bg-rose-100 text-rose-800",
-    "bg-cyan-100 text-cyan-800",
-    "bg-indigo-100 text-indigo-800",
-    "bg-teal-100 text-teal-800",
-    "bg-fuchsia-100 text-fuchsia-800",
-    "bg-lime-100 text-lime-800",
-    "bg-orange-100 text-orange-800",
-    "bg-sky-100 text-sky-800",
-  ];
-  let h = 0;
-  for (let i = 0; i < province.length; i++) {
-    h = (h * 31 + province.charCodeAt(i)) >>> 0;
+/** Count offline sites per label (province / credential), count-descending. */
+function groupOfflineSites(
+  sites: Project[],
+  key: (site: Project) => string
+): { label: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const site of sites) {
+    const k = key(site);
+    counts.set(k, (counts.get(k) || 0) + 1);
   }
-  return palette[h % palette.length];
+  return [...counts.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+/** Stable badge style for a province name (bordered pill, light mode). */
+function provinceBadgeClass(province?: string): string {
+  if (!province) return "border border-gray-300 bg-gray-100 text-gray-600";
+  return "border border-emerald-300 bg-emerald-50 text-emerald-700";
+}
+
+/** Region X (Northern Mindanao) provinces the map tour may visit. */
+const REGION_10_PROVINCES = new Set([
+  "bukidnon",
+  "camiguin",
+  "lanao del norte",
+  "misamis occidental",
+  "misamis oriental",
+]);
+
+/** Loose Region 10 bounding box (south, west, north, east). */
+const REGION_10_BBOX: [number, number, number, number] = [7.0, 123.0, 9.6, 126.0];
+
+/** True only for sites inside Region 10; uses coords when province is unknown. */
+function isInRegion10(
+  province?: string,
+  latitude?: number,
+  longitude?: number
+): boolean {
+  if (province) {
+    const p = province.split(",")[0].trim().toLowerCase();
+    // A present province that is not Region 10 is authoritative (no bbox
+    // fallback), so nearby regions like Davao/Surigao can never slip in.
+    return (
+      REGION_10_PROVINCES.has(p) ||
+      p.startsWith("misamis") ||
+      p === "northern mindanao" ||
+      p === "region x" ||
+      p === "region 10"
+    );
+  }
+  if (latitude == null || longitude == null) return false;
+  return (
+    latitude >= REGION_10_BBOX[0] &&
+    longitude >= REGION_10_BBOX[1] &&
+    latitude <= REGION_10_BBOX[2] &&
+    longitude <= REGION_10_BBOX[3]
+  );
 }
 
 export default function Dashboard() {
@@ -230,6 +365,35 @@ export default function Dashboard() {
   > | null>(null);
   const router = useRouter();
 
+  // Sync-finished alarm state: beep every few seconds until the deadline.
+  const beepUntilRef = useRef(0);
+  const beepTimerRef = useRef<number | undefined>(undefined);
+  const prevCountdownRef = useRef<number | null>(null);
+
+  const stopBeeping = useCallback(() => {
+    if (beepTimerRef.current) {
+      window.clearInterval(beepTimerRef.current);
+      beepTimerRef.current = undefined;
+    }
+    beepUntilRef.current = 0;
+  }, []);
+
+  const startBeepSession = useCallback(() => {
+    beepUntilRef.current = Date.now() + BEEP_DURATION_MS;
+    playBeep();
+    if (beepTimerRef.current) return;
+    beepTimerRef.current = window.setInterval(() => {
+      if (Date.now() >= beepUntilRef.current) {
+        stopBeeping();
+        return;
+      }
+      playBeep();
+    }, BEEP_REPEAT_MS);
+  }, [stopBeeping]);
+
+  // Cleanup any beeping on unmount.
+  useEffect(() => stopBeeping, [stopBeeping]);
+
   const fetchAll = useCallback(async (force = false) => {
     // Idempotent: drop concurrent/spam force refreshes.
     if (force) {
@@ -240,6 +404,7 @@ export default function Dashboard() {
       }
       writeManualRefreshAt(Date.now());
       setRefreshing(true);
+      stopBeeping(); // manual sync acknowledges the alarm
     } else if (inFlightRef.current) {
       return;
     }
@@ -268,7 +433,8 @@ export default function Dashboard() {
       setProjects(dashData.projects || []);
       setOfflineDevices(dashData.offlineDevices || []);
       setOfflineSites(dashData.offlineSites || []);
-      setLimitedCreds(dashData.rateLimitedCredentials || []);
+      const limited = dashData.rateLimitedCredentials || [];
+      setLimitedCreds(limited);
 
       const interval =
         typeof dashData.statusIntervalSeconds === "number"
@@ -276,13 +442,20 @@ export default function Dashboard() {
           : DEFAULT_INTERVAL_SECONDS;
       const now = Date.now();
       let next = readNextRefreshAt();
-      // Keep the running window across page switches unless forced or expired.
-      if (force || !next || next <= now) {
+      if (limited.length > 0) {
+        // A credential is cooling down — the server answers from cache and
+        // makes no Ruijie calls, so poll fast and drop the banner as soon as
+        // the cooldown lifts instead of waiting out a full status cycle.
+        next = now + FAST_POLL_SECONDS * 1000;
+        writeNextRefreshAt(next);
+        setLastRefresh(new Date(now));
+      } else if (force || !next || next <= now) {
+        // Keep the running window across page switches unless forced or expired.
         next = now + interval * 1000;
         writeNextRefreshAt(next);
+        setLastRefresh(new Date(next - interval * 1000));
       }
       setRefreshCountdown(secondsUntil(next));
-      setLastRefresh(new Date(next - interval * 1000));
     } catch (error) {
       console.error("Error fetching dashboard:", error);
     } finally {
@@ -290,7 +463,7 @@ export default function Dashboard() {
       setRefreshing(false);
       setLoading(false);
     }
-  }, []);
+  }, [stopBeeping]);
 
   useEffect(() => {
     fetchAllRef.current = fetchAll;
@@ -370,10 +543,16 @@ export default function Dashboard() {
     const timer = setInterval(() => {
       const next = readNextRefreshAt();
       if (!next) return;
-      setRefreshCountdown(secondsUntil(next));
+      const secs = secondsUntil(next);
+      setRefreshCountdown(secs);
+      // Countdown just hit zero → the sync cycle finished: sound the alarm.
+      if (secs === 0 && prevCountdownRef.current !== null && prevCountdownRef.current > 0) {
+        startBeepSession();
+      }
+      prevCountdownRef.current = secs;
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [startBeepSession]);
 
   // Manual-refresh cooldown ticker (1/minute spam guard).
   useEffect(() => {
@@ -392,6 +571,11 @@ export default function Dashboard() {
     const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  const offlineSitesScrollRef = useRef<HTMLDivElement>(null);
+  const offlineDevicesScrollRef = useRef<HTMLDivElement>(null);
+  useAutoScroll(offlineSitesScrollRef);
+  useAutoScroll(offlineDevicesScrollRef);
 
   async function handleLogout() {
     await fetch("/api/auth/logout", { method: "POST" });
@@ -442,42 +626,75 @@ export default function Dashboard() {
   const totalDevices = projects.reduce((sum, p) => sum + p.totalCount, 0);
   const totalOnline = projects.reduce((sum, p) => sum + p.onlineCount, 0);
   const totalOffline = projects.reduce((sum, p) => sum + p.offlineCount, 0);
+  const sitesOnline = projects.length - offlineSites.length;
+  const sitesPct =
+    projects.length > 0 ? (sitesOnline / projects.length) * 100 : 0;
+  const devicesPct =
+    totalDevices > 0 ? (totalOnline / totalDevices) * 100 : 0;
 
-  // Offline sites known from aggregate counts but without per-device details
-  // (e.g. shared-project device list unavailable). Never claim "all online" then.
-  const offlineWithoutDetails = offlineSites.some(
-    (s) =>
-      s.offlineCount > 0 &&
-      !s.devices.some((d) => d.onlineStatus !== "ON")
+  const offlineByProvince = useMemo(
+    () => groupOfflineSites(offlineSites, (site) => site.province || "Unknown"),
+    [offlineSites]
+  );
+
+  const offlineByProject = useMemo(
+    () =>
+      groupOfflineSites(
+        offlineSites,
+        (site) => site.credentialName || "Unknown"
+      ),
+    [offlineSites]
+  );
+
+  // Offline sites in Region 10 with coordinates, for the auto-touring map.
+  const mapSites = useMemo<MapSite[]>(
+    () =>
+      projects
+        .filter(
+          (p) =>
+            p.offlineCount > 0 &&
+            p.latitude != null &&
+            p.longitude != null &&
+            isInRegion10(p.province, p.latitude, p.longitude)
+        )
+        .map((p) => ({
+          key: `${p.credentialId}-${p.groupId}`,
+          name: p.name,
+          latitude: p.latitude as number,
+          longitude: p.longitude as number,
+          offlineCount: p.offlineCount,
+        })),
+    [projects]
   );
 
   return (
-    <div className="h-screen w-screen bg-gray-50 p-6 overflow-auto">
-      <div className="w-full">
-        <header className="mb-6 flex justify-between items-center">
+    <div className="min-h-screen w-screen bg-gray-100 flex flex-col p-4 gap-4 lg:h-screen lg:overflow-hidden">
+      <div className="w-full flex-1 min-h-0 flex flex-col gap-4">
+        <header className="shrink-0 flex flex-wrap justify-between items-center gap-3">
           <div>
-            <h1 className="text-3xl font-bold text-gray-900">MULTIFACTORS SALES MONITORING</h1>
-            <p className="text-sm text-gray-500 mt-1 flex items-center gap-2">
-              <span>{currentDate}</span>
-              <span className="font-mono text-gray-600">{currentTime}</span>
+            <h1 className="text-2xl font-bold text-gray-900">
+              Multifactors Sales Monitoring
+            </h1>
+            <p className="text-sm text-gray-500 mt-1">
+              {currentDate}, {currentTime}
             </p>
           </div>
           <div className="flex items-center gap-3">
             {lastRefresh && (
-              <span className="text-xs text-gray-400">
-                Updating in: {Math.floor(refreshCountdown / 60)}:
+              <span className="text-xs text-gray-500">
+                Updating in {Math.floor(refreshCountdown / 60)}:
                 {String(refreshCountdown % 60).padStart(2, "0")}
               </span>
             )}
             <button
               onClick={() => fetchAll(true)}
               disabled={refreshDisabled}
-              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md shadow-sm hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
             >
               {refreshing ? (
                 <>
                   <svg
-                    className="animate-spin h-4 w-4 text-gray-500"
+                    className="animate-spin h-4 w-4"
                     xmlns="http://www.w3.org/2000/svg"
                     fill="none"
                     viewBox="0 0 24 24"
@@ -500,35 +717,35 @@ export default function Dashboard() {
                   Syncing...
                 </>
               ) : manualCooldown > 0 ? (
-                `Sync Data (${manualCooldown}s)`
+                `Sync data (${manualCooldown}s)`
               ) : (
-                "Sync Data"
+                "Sync data"
               )}
             </button>
             <button
               onClick={() => router.push("/sites")}
-              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-blue-600 rounded-md hover:bg-blue-700"
+              className="px-4 py-2 text-sm font-medium text-blue-600 bg-white border border-blue-500 rounded-md shadow-sm hover:bg-blue-50"
             >
-              All Sites
+              All sites
             </button>
             <div className="relative" ref={profileRef}>
               <button
                 onClick={() => setProfileOpen((o) => !o)}
                 aria-label="Profile menu"
-                className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                className="w-10 h-10 rounded-full bg-transparent text-blue-600 border border-blue-600 flex items-center justify-center hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-400"
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                 </svg>
               </button>
               {profileOpen && (
-                <div className="absolute right-0 mt-2 w-44 bg-white border border-gray-200 rounded-md shadow-lg z-20 py-1">
+                <div className="absolute right-0 top-full mt-2 w-44 bg-white border border-gray-200 rounded-md shadow-lg z-20 p-1 space-y-1">
                   <button
                     onClick={() => {
                       setProfileOpen(false);
                       router.push("/settings");
                     }}
-                    className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                    className="w-full text-left px-4 py-2 text-sm text-blue-600 bg-transparent rounded hover:bg-blue-50"
                   >
                     Settings
                   </button>
@@ -537,7 +754,7 @@ export default function Dashboard() {
                       setProfileOpen(false);
                       handleLogout();
                     }}
-                    className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50"
+                    className="w-full text-left px-4 py-2 text-sm text-red-600 bg-transparent rounded hover:bg-red-50"
                   >
                     Logout
                   </button>
@@ -548,13 +765,13 @@ export default function Dashboard() {
         </header>
 
         {authExpired && (
-          <div className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4 flex items-center justify-between">
+          <div className="shrink-0 bg-red-50 border border-red-200 rounded-lg p-4 flex items-center justify-between">
             <p className="text-red-800 font-medium">
               Your session has expired. You stay signed in until you log out.
             </p>
             <button
               onClick={() => router.push("/login")}
-              className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700 shrink-0 ml-4"
+              className="px-4 py-2 text-sm font-medium text-red-600 bg-transparent border border-red-600 rounded-md hover:bg-red-50 shrink-0 ml-4"
             >
               Log in again
             </button>
@@ -562,7 +779,7 @@ export default function Dashboard() {
         )}
 
         {rateLimited && (
-          <div className="mb-6 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <div className="shrink-0 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
             <p className="text-yellow-800 font-medium">Rate limited by Ruijie API</p>
             <p className="text-yellow-700 text-sm">
               Auto-refresh paused. Wait a few minutes then click Sync Data.
@@ -571,7 +788,7 @@ export default function Dashboard() {
         )}
 
         {limitedCreds.length > 0 && (
-          <div className="mb-6 bg-orange-50 border border-orange-200 rounded-lg p-4">
+          <div className="shrink-0 bg-orange-50 border border-orange-200 rounded-lg p-4">
             <p className="text-orange-800 font-medium">
               Credential limit reached — projects hidden
             </p>
@@ -586,207 +803,353 @@ export default function Dashboard() {
           </div>
         )}
 
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-          <div className="bg-white rounded-lg shadow p-4">
-            <h3 className="text-sm font-medium text-gray-500">Sites</h3>
-            <p className="text-2xl font-bold text-blue-600">{projects.length}</p>
+        <div className="shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm px-5 py-4 flex flex-wrap items-center justify-between gap-x-8 gap-y-4">
+          <div className="flex flex-wrap gap-x-8 gap-y-3">
+            <div>
+              <p className="text-3xl font-bold leading-none text-blue-600">
+                {projects.length}
+              </p>
+              <p className="text-xs text-gray-500 mt-1.5">Sites</p>
+            </div>
+            <div>
+              <p className="text-3xl font-bold leading-none text-red-500">
+                {offlineSites.length}
+              </p>
+              <p className="text-xs text-gray-500 mt-1.5">Offline sites</p>
+            </div>
+            <div>
+              <p className="text-3xl font-bold leading-none text-gray-900">
+                {totalDevices}
+              </p>
+              <p className="text-xs text-gray-500 mt-1.5">Total devices</p>
+            </div>
+            <div>
+              <p className="text-3xl font-bold leading-none text-green-600">
+                {totalOnline}
+              </p>
+              <p className="text-xs text-gray-500 mt-1.5">Online</p>
+            </div>
+            <div>
+              <p className="text-3xl font-bold leading-none text-red-500">
+                {totalOffline}
+              </p>
+              <p className="text-xs text-gray-500 mt-1.5">Offline devices</p>
+            </div>
           </div>
-          <div className="bg-white rounded-lg shadow p-4">
-            <h3 className="text-sm font-medium text-gray-500">Total Devices</h3>
-            <p className="text-2xl font-bold text-purple-600">{totalDevices}</p>
-          </div>
-          <div className="bg-white rounded-lg shadow p-4">
-            <h3 className="text-sm font-medium text-gray-500">Online</h3>
-            <p className="text-2xl font-bold text-green-600">{totalOnline}</p>
-          </div>
-          <div className="bg-white rounded-lg shadow p-4">
-            <h3 className="text-sm font-medium text-gray-500">Offline</h3>
-            <p className="text-2xl font-bold text-red-600">{totalOffline}</p>
+          <div className="flex flex-col gap-3 min-w-[260px] flex-1 max-w-2xl">
+            <div>
+              <div className="flex items-center justify-between text-xs mb-1">
+                <span className="text-gray-600">Sites online</span>
+                <span className="text-gray-500">
+                  {sitesOnline} of {projects.length} · {sitesPct.toFixed(1)}%
+                </span>
+              </div>
+              <div className="h-2 bg-red-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                  style={{ width: `${sitesPct}%` }}
+                />
+              </div>
+            </div>
+            <div>
+              <div className="flex items-center justify-between text-xs mb-1">
+                <span className="text-gray-600">Devices online</span>
+                <span className="text-gray-500">
+                  {totalOnline} of {totalDevices} · {devicesPct.toFixed(1)}%
+                </span>
+              </div>
+              <div className="h-2 bg-red-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                  style={{ width: `${devicesPct}%` }}
+                />
+              </div>
+            </div>
           </div>
         </div>
 
-        {loading ? (
-          <div className="bg-white rounded-lg shadow p-12 text-center text-gray-500">
-            Loading dashboard data...
+        <main className="flex-1 min-h-0 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)_minmax(0,1fr)] lg:grid-rows-[1fr]">
+          {/* Left column: site map — auto-tours every site, one per 30s */}
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden h-[300px] lg:h-auto min-h-0">
+            <DashboardMap
+              sites={mapSites}
+              emptyText="No offline sites in Region 10"
+            />
           </div>
-        ) : (
-          <>
-            <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 mb-6">
-              {/* Offline Sites */}
-              <div className="lg:col-span-3 bg-white rounded-lg shadow flex flex-col">
-                <div className="p-4 border-b border-gray-200">
-                  <h2 className="text-lg font-semibold text-gray-900">
-                    Offline Sites
-                    <span className="ml-2 text-sm font-normal text-red-600">
-                      ({sortedOfflineSites.length})
-                    </span>
-                  </h2>
-                  <p className="text-xs text-gray-500 mt-0.5">
-                    Sorted by offline days (descending)
-                  </p>
-                </div>
-                <div className="divide-y divide-gray-200 overflow-y-auto max-h-[450px]">
-                  {sortedOfflineSites.length === 0 ? (
-                    <div className="p-12 text-center text-green-600">
-                      All sites have online devices!
-                    </div>
-                  ) : (
-                    sortedOfflineSites.map((site) => {
-                      const oldest = getSiteOldestOffline(site);
-                      return (
-                        <div
-                          key={`${site.credentialId}-${site.groupId}`}
-                          className="p-3 hover:bg-gray-50"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <h3 className="font-medium text-gray-900 text-sm truncate">
-                                  {site.name}
-                                </h3>
-                                <span
-                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${provinceBadgeClass(site.province)}`}
-                                >
-                                  {site.province || "Unknown"}
-                                </span>
-                              </div>
-                              <p className="text-xs text-gray-500 mt-0.5">
-                                ID: {site.groupId}
-                                {site.latitude != null &&
-                                  site.longitude != null &&
-                                  ` · ${site.latitude.toFixed(4)}, ${site.longitude.toFixed(4)}`}
-                              </p>
-                              {site.credentialName && (
-                                <p className="text-xs text-blue-500 mt-0.5">
-                                  {site.credentialName}
-                                </p>
-                              )}
-                            </div>
-                            <div className="text-right ml-3 shrink-0">
-                              <p className="text-red-600 font-semibold text-sm">
-                                {site.offlineCount} off
-                              </p>
-                              {site.onlineCount > 0 && (
-                                <p className="text-green-600 text-sm">
-                                  {site.onlineCount} on
-                                </p>
-                              )}
-                              {oldest > 0 && (
-                                <>
-                                  <p className="text-[11px] font-semibold text-orange-700 mt-0.5">
-                                    {formatOfflineDays(oldest)}
-                                  </p>
-                                  <p className="text-[10px] text-orange-600/80 leading-tight">
-                                    since {formatLastSeen(oldest)}
-                                  </p>
-                                </>
-                              )}
-                              {site.totalCount === 0 && (
-                                <p className="text-[10px] text-orange-500">No devices</p>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
 
-              {/* Offline Devices */}
-              <div className="lg:col-span-2 bg-white rounded-lg shadow flex flex-col">
-                <div className="p-4 border-b border-gray-200">
-                  <h2 className="text-lg font-semibold text-gray-900">
-                    Offline Devices
-                    <span className="ml-2 text-sm font-normal text-red-600">
-                      ({totalOffline})
-                    </span>
-                  </h2>
-                  <p className="text-xs text-gray-500 mt-0.5">
-                    Sorted by offline days (descending)
-                  </p>
-                </div>
-                <div className="divide-y divide-gray-200 overflow-y-auto max-h-[450px]">
-                  {sortedOfflineDevices.length === 0 && !offlineWithoutDetails && (
-                    <div className="p-12 text-center text-green-600">
-                      All devices are online!
-                    </div>
-                  )}
-                  {offlineWithoutDetails && (
-                    <div className="p-3 text-center text-sm text-orange-700 bg-orange-50">
-                      Some offline sites report offline devices, but device
-                      details are unavailable.
-                    </div>
-                  )}
-                  {sortedOfflineDevices.map((device) => (
-                      <div
-                        key={`${device.credentialName}-${device.serialNumber}`}
-                        className="p-3 hover:bg-gray-50"
+          {/* Middle column: By province + Offline sites */}
+          <div className="flex flex-col gap-4 min-h-0">
+            <div className="shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold text-gray-900">
+                  By province
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
+                    {offlineSites.length}
+                  </span>
+                </h2>
+                <span className="text-xs text-gray-400">Offline sites</span>
+              </div>
+              <div className="divide-y divide-gray-100">
+                {offlineByProvince.length === 0 ? (
+                  <div className="p-6 text-center text-sm text-green-600">
+                    All sites online!
+                  </div>
+                ) : (
+                  offlineByProvince.map(({ label, count }) => (
+                    <div
+                      key={label}
+                      className="flex items-center gap-2.5 px-4 py-2.5"
+                    >
+                      <span
+                        className={`inline-flex items-center min-w-0 truncate px-2 py-0.5 rounded text-[11px] font-semibold ${provinceBadgeClass(label === "Unknown" ? undefined : label)}`}
                       >
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium shrink-0 ${
-                              device.detailsUnavailable
-                                ? "bg-orange-100 text-orange-800"
-                                : "bg-red-100 text-red-800"
-                            }`}
-                          >
-                            {device.detailsUnavailable
-                              ? `${device.offlineCount ?? "?"} off`
-                              : "OFF"}
-                          </span>
+                        {label}
+                      </span>
+                      <div className="flex-1 min-w-0 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-red-400 rounded-full"
+                          style={{
+                            width: `${Math.max(6, (count / offlineByProvince[0].count) * 100)}%`,
+                          }}
+                        />
+                      </div>
+                      <span className="w-5 text-right text-sm font-bold text-red-500">
+                        {count}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Offline sites */}
+            <div className="flex-1 min-h-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold text-gray-900">
+                  Offline sites
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
+                    {sortedOfflineSites.length}
+                  </span>
+                </h2>
+                <span className="text-xs text-gray-400">
+                  Longest offline first
+                </span>
+              </div>
+              <div
+                ref={offlineSitesScrollRef}
+                className="flex-1 min-h-0 overflow-y-auto divide-y divide-gray-100"
+              >
+                {loading ? (
+                  <div className="p-8 text-center text-sm text-gray-500">
+                    Loading dashboard data...
+                  </div>
+                ) : sortedOfflineSites.length === 0 ? (
+                  <div className="p-12 text-center text-green-600">
+                    All sites online!
+                  </div>
+                ) : (
+                  sortedOfflineSites.map((site) => {
+                    const oldest = getSiteOldestOffline(site);
+                    const sev = outageSeverity(offlineDays(oldest));
+                    return (
+                      <div
+                        key={`${site.credentialId}-${site.groupId}`}
+                        className={`border-l-4 ${sev.border} px-3 py-3 hover:bg-gray-50`}
+                      >
+                        <div className="flex items-start gap-3">
                           <div className="min-w-0 flex-1">
-                            <h3 className="font-medium text-gray-900 text-sm truncate">
-                              {device.aliasName || device.name || device.productClass}
+                            <h3 className="text-sm font-semibold text-gray-900 leading-snug">
+                              {site.name}
                             </h3>
-                            <p className="text-xs text-gray-500 truncate">
-                              {device.detailsUnavailable ? (
-                                <>
-                                  {device.productClass &&
-                                    `${device.productClass} · `}
-                                  details unavailable
-                                </>
-                              ) : (
-                                <>
-                                  {device.productClass}
-                                  {device.serialNumber &&
-                                    ` · ${device.serialNumber}`}
-                                  {(device.localIp || device.cpeIp) &&
-                                    ` · ${device.localIp || device.cpeIp}`}
-                                </>
-                              )}
+                            <div className="mt-1.5">
+                              <span
+                                className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold ${provinceBadgeClass(site.province)}`}
+                              >
+                                {site.province || "Unknown"}
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-500 mt-1">
+                              {site.latitude != null &&
+                                site.longitude != null &&
+                                `${site.latitude.toFixed(4)}, ${site.longitude.toFixed(4)}`}
                             </p>
-                            <p className="text-xs text-gray-400 truncate">
-                              {device.groupName}
-                              {device.credentialName && ` (${device.credentialName})`}
-                            </p>
-                            {(device.latitude != null || device.province) && (
-                              <p className="text-[10px] text-gray-400 truncate">
-                                {device.province}
-                                {device.latitude != null &&
-                                  device.longitude != null &&
-                                  ` · ${device.latitude.toFixed(4)}, ${device.longitude.toFixed(4)}`}
+                            {site.credentialName && (
+                              <p className="text-xs font-medium text-blue-600 mt-1 uppercase">
+                                {site.credentialName}
                               </p>
                             )}
                           </div>
-                          {!device.detailsUnavailable && device.lastOnline > 0 && (
-                            <div className="text-right shrink-0 max-w-[10.5rem]">
-                              <span className="block text-[11px] text-orange-700 font-semibold">
-                                {formatOfflineDays(device.lastOnline)}
-                              </span>
-                              <span className="block text-[10px] text-orange-600/80 leading-tight">
-                                {formatLastSeen(device.lastOnline)}
-                              </span>
-                            </div>
-                          )}
+                          <div className="hidden sm:block shrink-0 text-right max-w-[11rem] text-xs text-gray-500 leading-snug pt-0.5">
+                            <p>{site.offlineCount} devices off</p>
+                            {oldest > 0 && (
+                              <p className="text-gray-400 mt-0.5">
+                                since {formatLastSeenShort(oldest)}
+                              </p>
+                            )}
+                          </div>
+                          <div className="shrink-0 text-right min-w-[7rem] pt-0.5">
+                            {oldest > 0 ? (
+                              <p className={`text-sm font-bold ${sev.text}`}>
+                                {formatOfflineDays(oldest)}
+                              </p>
+                            ) : (
+                              <p className="text-xs text-gray-400">Unknown</p>
+                            )}
+                          </div>
                         </div>
                       </div>
-                    ))}
-                </div>
+                    );
+                  })
+                )}
               </div>
             </div>
-          </>
-        )}
+          </div>
+
+          {/* Right column: By project + Offline devices */}
+          <div className="flex flex-col gap-4 min-h-0">
+            <div className="shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold text-gray-900">
+                  By project
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
+                    {offlineSites.length}
+                  </span>
+                </h2>
+                <span className="text-xs text-gray-400">Offline sites</span>
+              </div>
+              <div className="divide-y divide-gray-100">
+                {offlineByProject.length === 0 ? (
+                  <div className="p-6 text-center text-sm text-green-600">
+                    All sites online!
+                  </div>
+                ) : (
+                  offlineByProject.map(({ label, count }) => (
+                    <div
+                      key={label}
+                      className="flex items-center gap-2.5 px-4 py-2.5"
+                    >
+                      <span className="text-sm font-medium text-gray-800 min-w-0 shrink truncate">
+                        {label}
+                      </span>
+                      <div className="flex-1 min-w-0 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-red-400 rounded-full"
+                          style={{
+                            width: `${Math.max(6, (count / offlineByProject[0].count) * 100)}%`,
+                          }}
+                        />
+                      </div>
+                      <span className="w-5 text-right text-sm font-bold text-red-500">
+                        {count}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Offline devices */}
+            <div className="flex-1 min-h-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold text-gray-900">
+                  Offline devices
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
+                    {totalOffline}
+                  </span>
+                </h2>
+                <span className="text-xs text-gray-400">
+                  Longest offline first
+                </span>
+              </div>
+              <div
+                ref={offlineDevicesScrollRef}
+                className="flex-1 min-h-0 overflow-y-auto divide-y divide-gray-100"
+              >
+                {loading ? (
+                  <div className="p-8 text-center text-sm text-gray-500">
+                    Loading dashboard data...
+                  </div>
+                ) : (
+                  <>
+                    {sortedOfflineDevices.length === 0 && (
+                      <div className="p-12 text-center text-green-600">
+                        All devices are online!
+                      </div>
+                    )}
+                    {sortedOfflineDevices.map((device) => {
+                      const sev = outageSeverity(offlineDays(device.lastOnline));
+                      return (
+                        <div
+                          key={`${device.credentialName}-${device.serialNumber}`}
+                          className={`border-l-4 ${sev.border} px-3 py-2.5 hover:bg-gray-50`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <h3 className="text-sm font-semibold text-gray-900 truncate">
+                                  {device.aliasName ||
+                                    device.name ||
+                                    device.productClass}
+                                </h3>
+                                <span
+                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                                    device.detailsUnavailable
+                                      ? "bg-orange-100 text-orange-700"
+                                      : "bg-red-100 text-red-700"
+                                  }`}
+                                >
+                                  {device.detailsUnavailable
+                                    ? `${device.offlineCount ?? "?"} off`
+                                    : "Off"}
+                                </span>
+                              </div>
+                              <p className="text-xs text-gray-500 mt-0.5 truncate">
+                                {device.detailsUnavailable ? (
+                                  <>
+                                    {device.productClass &&
+                                      `${device.productClass} · `}
+                                    details unavailable
+                                  </>
+                                ) : (
+                                  <>
+                                    {device.productClass}
+                                    {device.serialNumber &&
+                                      ` · ${device.serialNumber}`}
+                                    {(device.localIp || device.cpeIp) &&
+                                      ` · ${device.localIp || device.cpeIp}`}
+                                  </>
+                                )}
+                              </p>
+                              <p className="text-xs text-gray-400 mt-0.5 truncate">
+                                {device.groupName}
+                                {device.credentialName && (
+                                  <span className="text-blue-600 uppercase">
+                                    {" "}
+                                    · {device.credentialName}
+                                  </span>
+                                )}
+                              </p>
+                            </div>
+                            {device.lastOnline > 0 && (
+                              <div className="shrink-0 text-right max-w-[10rem]">
+                                <p className={`text-sm font-bold ${sev.text}`}>
+                                  {formatOfflineDays(device.lastOnline)}
+                                </p>
+                                <p className="text-xs text-gray-400 mt-0.5 leading-tight">
+                                  {formatLastSeenShort(device.lastOnline)}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </main>
       </div>
     </div>
   );

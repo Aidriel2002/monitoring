@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
-import { refreshCredentialInventory, RuijieCredentials } from "@/lib/ruijie";
+import {
+  fetchProjectTree,
+  getReceivedProjects,
+  refreshCredentialInventory,
+  RuijieCredentials,
+} from "@/lib/ruijie";
+import { mapSharedProjects, ProjectsCache } from "@/lib/projects-cache";
 import { cacheClear } from "@/lib/cache";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 
@@ -59,6 +65,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (cred.is_active === false) {
+      return NextResponse.json(
+        { error: "Credential is disabled — enable it in Settings first." },
+        { status: 400 }
+      );
+    }
+
     const credentials: RuijieCredentials = {
       appId: cred.app_id,
       secret: cred.secret,
@@ -67,6 +80,37 @@ export async function POST(request: NextRequest) {
     };
 
     const result = await refreshCredentialInventory(credentials);
+
+    try {
+      const { tree, flat } = await fetchProjectTree(credentials);
+      const received = await getReceivedProjects(credentials).catch(
+        () => null
+      );
+      const built: ProjectsCache = {
+        fetchedAt: Date.now(),
+        projects: flat.map((p) => ({
+          groupId: p.groupId,
+          name: p.name,
+          type: p.type,
+          description: p.description,
+        })),
+        tree,
+        sharedProjects: received ? mapSharedProjects(received) : [],
+      };
+      const { error: cacheError } = await supabase
+        .from("api_credentials")
+        .update({ projects_cache: built })
+        .eq("id", credentialId)
+        .eq("user_id", user.id);
+      if (cacheError) {
+        console.warn("projects_cache save failed:", cacheError.message);
+      }
+    } catch (e) {
+      console.warn(
+        "projects_cache save failed:",
+        e instanceof Error ? e.message : e
+      );
+    }
 
     cacheClear(`dashboard:${user.id}`);
     void broadcastDashboardUpdate(user.id, {});
