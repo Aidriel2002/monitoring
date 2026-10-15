@@ -1,10 +1,49 @@
 import { cacheGet, cacheSet } from "@/lib/cache";
 import { diskGet, diskSet } from "@/lib/disk-cache";
+import { getSupabaseServiceRole } from "@/lib/supabase";
 
 /** Province labels do not change — cache essentially forever. */
 const TTL_PROVINCE_MS = 365 * 24 * 60 * 60_000;
 /** Failed lookups only — retry soon; never write these to disk. */
 const TTL_NEGATIVE_MS = 10 * 60_000;
+
+/**
+ * Durable Supabase cache — survives Netlify's ephemeral / read-only
+ * filesystem where the disk cache (.cache/) cannot persist across cold
+ * starts. Only positive results are stored (negatives are transient).
+ * Best-effort: every failure degrades silently to the external geocoder.
+ */
+async function geoDbGet<T>(key: string): Promise<T | undefined> {
+  try {
+    const sb = getSupabaseServiceRole();
+    const { data, error } = await sb
+      .from("geo_cache")
+      .select("value")
+      .eq("key", key)
+      .maybeSingle();
+    if (error || !data) return undefined;
+    return data.value as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function geoDbSet<T>(key: string, value: T): void {
+  try {
+    const sb = getSupabaseServiceRole();
+    void Promise.resolve(
+      sb.from("geo_cache").upsert({
+        key,
+        value,
+        stored_at: new Date().toISOString(),
+      })
+    )
+      .then(() => undefined)
+      .catch(() => undefined);
+  } catch {
+    // env not ready / table missing — ignore, memory + disk still hold it
+  }
+}
 
 interface BigDataAdmin {
   name?: string;
@@ -94,7 +133,17 @@ export async function reverseGeocodeProvince(
   const disk = diskGet<string | null>(key);
   if (disk !== undefined) {
     cacheSet(key, disk, TTL_PROVINCE_MS);
+    // Backfill Supabase from a warm local disk cache so Netlify can read it.
+    if (disk) geoDbSet(key, disk);
     return disk;
+  }
+
+  // Durable Supabase layer — survives Netlify cold starts where disk fails.
+  const db = await geoDbGet<string>(key);
+  if (db !== undefined) {
+    cacheSet(key, db, TTL_PROVINCE_MS);
+    diskSet(key, db);
+    return db;
   }
 
   try {
@@ -110,6 +159,7 @@ export async function reverseGeocodeProvince(
     if (province) {
       cacheSet(key, province, TTL_PROVINCE_MS);
       diskSet(key, province);
+      geoDbSet(key, province);
       return province;
     }
     // HTTP OK but no province field — retry later; never disk-cache null.
@@ -340,7 +390,17 @@ export async function geocodeSiteName(
   const disk = diskGet<SiteGeo | null>(key);
   if (disk !== undefined) {
     cacheSet(key, disk, TTL_PROVINCE_MS);
+    // Backfill Supabase from a warm local disk cache so Netlify can read it.
+    if (disk) geoDbSet(key, disk);
     return disk;
+  }
+
+  // Durable Supabase layer — survives Netlify cold starts where disk fails.
+  const db = await geoDbGet<SiteGeo>(key);
+  if (db !== undefined) {
+    cacheSet(key, db, TTL_PROVINCE_MS);
+    diskSet(key, db);
+    return db;
   }
 
   const started = Date.now();
@@ -380,6 +440,7 @@ export async function geocodeSiteName(
       const result: SiteGeo = { latitude, longitude };
       cacheSet(key, result, TTL_PROVINCE_MS);
       diskSet(key, result);
+      geoDbSet(key, result);
       return result;
     }
 

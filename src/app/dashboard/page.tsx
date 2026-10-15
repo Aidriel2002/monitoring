@@ -574,8 +574,12 @@ export default function Dashboard() {
 
   const offlineSitesScrollRef = useRef<HTMLDivElement>(null);
   const offlineDevicesScrollRef = useRef<HTMLDivElement>(null);
+  const byProvinceScrollRef = useRef<HTMLDivElement>(null);
+  const byProjectScrollRef = useRef<HTMLDivElement>(null);
   useAutoScroll(offlineSitesScrollRef);
   useAutoScroll(offlineDevicesScrollRef);
+  useAutoScroll(byProvinceScrollRef);
+  useAutoScroll(byProjectScrollRef);
 
   async function handleLogout() {
     await fetch("/api/auth/logout", { method: "POST" });
@@ -668,7 +672,7 @@ export default function Dashboard() {
   );
 
   return (
-    <div className="min-h-screen w-screen bg-gray-100 flex flex-col p-4 gap-4 lg:h-screen lg:overflow-hidden">
+    <div className="min-h-screen w-full bg-gray-100 flex flex-col p-4 gap-4 lg:h-screen lg:overflow-hidden">
       <div className="w-full flex-1 min-h-0 flex flex-col gap-4">
         <header className="shrink-0 flex flex-wrap justify-between items-center gap-3">
           <div>
@@ -868,28 +872,32 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <main className="flex-1 min-h-0 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)_minmax(0,1fr)] lg:grid-rows-[1fr]">
+        <main className="flex-1 min-h-0 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)_minmax(0,1fr)] lg:grid-rows-[auto_minmax(0,1fr)]">
           {/* Left column: site map — auto-tours every site, one per 30s */}
-          <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden h-[300px] lg:h-auto min-h-0">
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden h-[300px] lg:h-auto lg:row-span-2 min-h-0">
             <DashboardMap
               sites={mapSites}
               emptyText="No offline sites in Region 10"
             />
           </div>
 
-          {/* Middle column: By province + Offline sites */}
-          <div className="flex flex-col gap-4 min-h-0">
-            <div className="shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
-                <h2 className="text-sm font-semibold text-gray-900">
+          {/* Offline breakdown: By province + By project — two lists in one card */}
+          <div className="lg:col-span-2 bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-gray-100">
+            {/* By province */}
+            <div className="flex flex-col min-h-0">
+              <div className="px-3.5 py-2.5 border-b border-gray-100 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-[13px] font-semibold text-gray-900">
                   By province
                   <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
                     {offlineSites.length}
                   </span>
                 </h2>
-                <span className="text-xs text-gray-400">Offline sites</span>
+                <span className="text-[11px] text-gray-400">Most offline first</span>
               </div>
-              <div className="divide-y divide-gray-100">
+              <div
+                ref={byProvinceScrollRef}
+                className="h-[72px] overflow-y-auto list-scroll divide-y divide-gray-100"
+              >
                 {offlineByProvince.length === 0 ? (
                   <div className="p-6 text-center text-sm text-green-600">
                     All sites online!
@@ -898,7 +906,7 @@ export default function Dashboard() {
                   offlineByProvince.map(({ label, count }) => (
                     <div
                       key={label}
-                      className="flex items-center gap-2.5 px-4 py-2.5"
+                      className="h-9 flex items-center gap-2 px-3.5"
                     >
                       <span
                         className={`inline-flex items-center min-w-0 truncate px-2 py-0.5 rounded text-[11px] font-semibold ${provinceBadgeClass(label === "Unknown" ? undefined : label)}`}
@@ -913,7 +921,7 @@ export default function Dashboard() {
                           }}
                         />
                       </div>
-                      <span className="w-5 text-right text-sm font-bold text-red-500">
+                      <span className="w-5 text-right text-[13px] font-bold text-red-500">
                         {count}
                       </span>
                     </div>
@@ -922,10 +930,56 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {/* Offline sites */}
-            <div className="flex-1 min-h-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
-                <h2 className="text-sm font-semibold text-gray-900">
+            {/* By project */}
+            <div className="flex flex-col min-h-0">
+              <div className="px-3.5 py-2.5 border-b border-gray-100 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-[13px] font-semibold text-gray-900">
+                  By project
+                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
+                    {offlineSites.length}
+                  </span>
+                </h2>
+                <span className="text-[11px] text-gray-400">Most offline first</span>
+              </div>
+              <div
+                ref={byProjectScrollRef}
+                className="h-[72px] overflow-y-auto list-scroll divide-y divide-gray-100"
+              >
+                {offlineByProject.length === 0 ? (
+                  <div className="p-6 text-center text-sm text-green-600">
+                    All sites online!
+                  </div>
+                ) : (
+                  offlineByProject.map(({ label, count }) => (
+                    <div
+                      key={label}
+                      className="h-9 flex items-center gap-2 px-3.5"
+                    >
+                      <span className="text-[13px] font-medium text-gray-800 min-w-0 shrink truncate">
+                        {label}
+                      </span>
+                      <div className="flex-1 min-w-0 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-red-400 rounded-full"
+                          style={{
+                            width: `${Math.max(6, (count / offlineByProject[0].count) * 100)}%`,
+                          }}
+                        />
+                      </div>
+                      <span className="w-5 text-right text-[13px] font-bold text-red-500">
+                        {count}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Offline sites */}
+          <div className="flex-1 min-h-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
+              <div className="px-3.5 py-2.5 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-[13px] font-semibold text-gray-900">
                   Offline sites
                   <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
                     {sortedOfflineSites.length}
@@ -937,7 +991,7 @@ export default function Dashboard() {
               </div>
               <div
                 ref={offlineSitesScrollRef}
-                className="flex-1 min-h-0 overflow-y-auto divide-y divide-gray-100"
+                className="flex-1 min-h-0 overflow-y-auto list-scroll divide-y divide-gray-100"
               >
                 {loading ? (
                   <div className="p-8 text-center text-sm text-gray-500">
@@ -954,44 +1008,29 @@ export default function Dashboard() {
                     return (
                       <div
                         key={`${site.credentialId}-${site.groupId}`}
-                        className={`border-l-4 ${sev.border} px-3 py-3 hover:bg-gray-50`}
+                          className={`border-l-4 ${sev.border} px-2.5 py-2 hover:bg-gray-50`}
                       >
-                        <div className="flex items-start gap-3">
+                        <div className="flex items-start gap-2 min-w-0">
                           <div className="min-w-0 flex-1">
-                            <h3 className="text-sm font-semibold text-gray-900 leading-snug">
+                            <h3 className="truncate text-xs font-semibold text-gray-900">
                               {site.name}
                             </h3>
-                            <div className="mt-1.5">
-                              <span
-                                className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold ${provinceBadgeClass(site.province)}`}
-                              >
-                                {site.province || "Unknown"}
-                              </span>
-                            </div>
-                            <p className="text-xs text-gray-500 mt-1">
-                              {site.latitude != null &&
-                                site.longitude != null &&
-                                `${site.latitude.toFixed(4)}, ${site.longitude.toFixed(4)}`}
-                            </p>
-                            {site.credentialName && (
-                              <p className="text-xs font-medium text-blue-600 mt-1 uppercase">
-                                {site.credentialName}
-                              </p>
-                            )}
+                            <span
+                              className={`mt-1 inline-flex items-center max-w-[6.5rem] truncate px-1.5 py-0.5 rounded text-[9px] font-semibold ${provinceBadgeClass(site.province)}`}
+                            >
+                              {site.province || "Unknown"}
+                            </span>
                           </div>
-                          <div className="hidden sm:block shrink-0 text-right max-w-[11rem] text-xs text-gray-500 leading-snug pt-0.5">
-                            <p>{site.offlineCount} devices off</p>
-                            {oldest > 0 && (
-                              <p className="text-gray-400 mt-0.5">
-                                since {formatLastSeenShort(oldest)}
-                              </p>
-                            )}
-                          </div>
-                          <div className="shrink-0 text-right min-w-[7rem] pt-0.5">
+                          <div className="shrink-0 text-right min-w-[5.5rem] whitespace-nowrap">
                             {oldest > 0 ? (
-                              <p className={`text-sm font-bold ${sev.text}`}>
-                                {formatOfflineDays(oldest)}
-                              </p>
+                              <>
+                                <p className={`text-xs font-bold ${sev.text}`}>
+                                  {formatOfflineDays(oldest)}
+                                </p>
+                                <p className="text-[10px] text-gray-400 mt-0.5 leading-tight">
+                                  {formatLastSeenShort(oldest)}
+                                </p>
+                              </>
                             ) : (
                               <p className="text-xs text-gray-400">Unknown</p>
                             )}
@@ -1003,55 +1042,11 @@ export default function Dashboard() {
                 )}
               </div>
             </div>
-          </div>
 
-          {/* Right column: By project + Offline devices */}
-          <div className="flex flex-col gap-4 min-h-0">
-            <div className="shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
-                <h2 className="text-sm font-semibold text-gray-900">
-                  By project
-                  <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
-                    {offlineSites.length}
-                  </span>
-                </h2>
-                <span className="text-xs text-gray-400">Offline sites</span>
-              </div>
-              <div className="divide-y divide-gray-100">
-                {offlineByProject.length === 0 ? (
-                  <div className="p-6 text-center text-sm text-green-600">
-                    All sites online!
-                  </div>
-                ) : (
-                  offlineByProject.map(({ label, count }) => (
-                    <div
-                      key={label}
-                      className="flex items-center gap-2.5 px-4 py-2.5"
-                    >
-                      <span className="text-sm font-medium text-gray-800 min-w-0 shrink truncate">
-                        {label}
-                      </span>
-                      <div className="flex-1 min-w-0 h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-red-400 rounded-full"
-                          style={{
-                            width: `${Math.max(6, (count / offlineByProject[0].count) * 100)}%`,
-                          }}
-                        />
-                      </div>
-                      <span className="w-5 text-right text-sm font-bold text-red-500">
-                        {count}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            {/* Offline devices */}
+          {/* Offline devices */}
             <div className="flex-1 min-h-0 bg-white rounded-xl border border-gray-200 shadow-sm flex flex-col overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
-                <h2 className="text-sm font-semibold text-gray-900">
+              <div className="px-3.5 py-2.5 border-b border-gray-200 shrink-0 flex items-center justify-between gap-2">
+                <h2 className="text-[13px] font-semibold text-gray-900">
                   Offline devices
                   <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-red-100 text-red-600 text-xs font-semibold">
                     {totalOffline}
@@ -1063,7 +1058,7 @@ export default function Dashboard() {
               </div>
               <div
                 ref={offlineDevicesScrollRef}
-                className="flex-1 min-h-0 overflow-y-auto divide-y divide-gray-100"
+                className="flex-1 min-h-0 overflow-y-auto list-scroll divide-y divide-gray-100"
               >
                 {loading ? (
                   <div className="p-8 text-center text-sm text-gray-500">
@@ -1081,61 +1076,20 @@ export default function Dashboard() {
                       return (
                         <div
                           key={`${device.credentialName}-${device.serialNumber}`}
-                          className={`border-l-4 ${sev.border} px-3 py-2.5 hover:bg-gray-50`}
+                        className={`border-l-4 ${sev.border} px-2.5 py-2 hover:bg-gray-50`}
                         >
                           <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <h3 className="text-sm font-semibold text-gray-900 truncate">
-                                  {device.aliasName ||
-                                    device.name ||
-                                    device.productClass}
-                                </h3>
-                                <span
-                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
-                                    device.detailsUnavailable
-                                      ? "bg-orange-100 text-orange-700"
-                                      : "bg-red-100 text-red-700"
-                                  }`}
-                                >
-                                  {device.detailsUnavailable
-                                    ? `${device.offlineCount ?? "?"} off`
-                                    : "Off"}
-                                </span>
-                              </div>
-                              <p className="text-xs text-gray-500 mt-0.5 truncate">
-                                {device.detailsUnavailable ? (
-                                  <>
-                                    {device.productClass &&
-                                      `${device.productClass} · `}
-                                    details unavailable
-                                  </>
-                                ) : (
-                                  <>
-                                    {device.productClass}
-                                    {device.serialNumber &&
-                                      ` · ${device.serialNumber}`}
-                                    {(device.localIp || device.cpeIp) &&
-                                      ` · ${device.localIp || device.cpeIp}`}
-                                  </>
-                                )}
-                              </p>
-                              <p className="text-xs text-gray-400 mt-0.5 truncate">
-                                {device.groupName}
-                                {device.credentialName && (
-                                  <span className="text-blue-600 uppercase">
-                                    {" "}
-                                    · {device.credentialName}
-                                  </span>
-                                )}
-                              </p>
-                            </div>
+                            <h3 className="min-w-0 flex-1 truncate text-xs font-semibold text-gray-900">
+                              {device.aliasName ||
+                                device.name ||
+                                device.productClass}
+                            </h3>
                             {device.lastOnline > 0 && (
-                              <div className="shrink-0 text-right max-w-[10rem]">
-                                <p className={`text-sm font-bold ${sev.text}`}>
+                              <div className="shrink-0 text-right whitespace-nowrap">
+                                <p className={`text-xs font-bold ${sev.text}`}>
                                   {formatOfflineDays(device.lastOnline)}
                                 </p>
-                                <p className="text-xs text-gray-400 mt-0.5 leading-tight">
+                                <p className="text-[10px] text-gray-400 mt-0.5 leading-tight">
                                   {formatLastSeenShort(device.lastOnline)}
                                 </p>
                               </div>
@@ -1148,7 +1102,6 @@ export default function Dashboard() {
                 )}
               </div>
             </div>
-          </div>
         </main>
       </div>
     </div>
