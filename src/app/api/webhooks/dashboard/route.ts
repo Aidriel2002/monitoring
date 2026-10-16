@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheClear } from "@/lib/cache";
+import { durableClear } from "@/lib/dashboard-cache";
 
 /**
  * POST /api/webhooks/dashboard
@@ -41,6 +42,8 @@ export async function POST(request: NextRequest) {
 
   // Wake each affected tab via realtime so they refetch immediately.
   if (userId) {
+    // Durable copy too — otherwise a cold start would keep serving it.
+    await durableClear(userId);
     const { broadcastDashboardUpdate } = await import("@/lib/realtime");
     await broadcastDashboardUpdate(userId, {});
   } else {
@@ -49,6 +52,7 @@ export async function POST(request: NextRequest) {
     const userIds = [...new Set((data || []).map((r) => r.user_id))];
     const { broadcastDashboardUpdate } = await import("@/lib/realtime");
     for (const id of userIds) {
+      await durableClear(id);
       await broadcastDashboardUpdate(id, {});
     }
   }

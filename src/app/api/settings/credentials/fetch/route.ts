@@ -8,6 +8,7 @@ import {
 } from "@/lib/ruijie";
 import { mapSharedProjects, ProjectsCache } from "@/lib/projects-cache";
 import { cacheClear } from "@/lib/cache";
+import { durableClear } from "@/lib/dashboard-cache";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 
 async function getUser(request: Request) {
@@ -112,7 +113,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // New inventory — drop both cache layers so the next dashboard load
+    // rebuilds from it (memory alone is per-instance on serverless).
     cacheClear(`dashboard:${user.id}`);
+    await durableClear(user.id);
     void broadcastDashboardUpdate(user.id, {});
 
     return NextResponse.json({

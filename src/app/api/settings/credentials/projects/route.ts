@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheClear } from "@/lib/cache";
+import { durableClear } from "@/lib/dashboard-cache";
 import {
   expandSelectionToLeaves,
   fetchProjectTree,
@@ -252,8 +253,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    // Selection changed — rebuild the dashboard on next poll.
+    // Selection changed — rebuild the dashboard on next poll. Both layers:
+    // memory alone is per-instance, and the durable Supabase payload would
+    // keep serving the pre-save site list for the rest of the 100-min cycle.
     cacheClear(`dashboard:${user.id}`);
+    await durableClear(user.id);
 
     return NextResponse.json({ success: true });
   } catch (error) {

@@ -1,17 +1,19 @@
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { diskGet, diskSet } from "@/lib/disk-cache";
+import { notifiedHashGet, notifiedHashSet } from "@/lib/dashboard-cache";
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const REQUEST_TIMEOUT_MS = 15_000;
 /** Cap report size — Telegram messages max out around 4096 chars. */
 const MAX_SITES = 40;
-const MAX_DEVICES_PER_SITE = 15;
 const MAX_TEXT_CHARS = 4000;
 /** Disk cache: phone → Telegram chat id (learned from bot inbox messages). */
 const CHAT_MAP_KEY = "tg:phone-chat-map";
 /** Inbox scans from the dashboard poll are throttled to one per minute. */
 const INBOX_SCAN_MIN_INTERVAL_MS = 60_000;
 let lastInboxScanAt = 0;
+/** One in-flight report per user per instance (parallel polls dedupe here). */
+const notifyingUsers = new Set<string>();
 
 interface InboxUpdate {
   update_id: number;
@@ -254,142 +256,171 @@ export async function sendTelegramMessage(
 }
 
 /**
- * Build the monitoring report text:
+ * Build the monitoring report text — one block per down site, separated by
+ * a blank line:
  *
- *   Good day, monitoring report: Offline sites
+ *   Good day, Down Site in Site A (Cavite).
  *
- *   SITE A (all devices offline)
- *   SITE B (2 of 6 devices offline)
- *     - device name 1
- *     - device name 2
- *   SITE C (3 devices offline)
+ *   Good day, Down Site in Site B (Rizal).
  */
 export function buildMonitoringReport(sites: NotifySite[]): string {
-  const lines = ["Good day, monitoring report: Offline sites", ""];
+  const blocks: string[] = [];
 
   for (const site of sites.slice(0, MAX_SITES)) {
-    const named = site.devices.filter((d) => !d.detailsUnavailable);
-    if (site.totalCount > 0 && site.offlineCount >= site.totalCount) {
-      lines.push(`${site.name} (all devices offline)`);
-    } else if (named.length > 0) {
-      lines.push(
-        `${site.name} (${site.offlineCount} of ${site.totalCount} devices offline)`
-      );
-      for (const d of named.slice(0, MAX_DEVICES_PER_SITE)) {
-        lines.push(
-          `  - ${d.aliasName || d.name || d.productClass || d.serialNumber}`
-        );
-      }
-      if (named.length > MAX_DEVICES_PER_SITE) {
-        lines.push(`  ...and ${named.length - MAX_DEVICES_PER_SITE} more`);
-      }
-    } else {
-      lines.push(
-        `${site.name} (${site.offlineCount} device${site.offlineCount === 1 ? "" : "s"} offline)`
-      );
-    }
+    const where = site.province ? ` (${site.province})` : "";
+    blocks.push(`Good day, Down Site in ${site.name}${where}.`);
   }
-
   if (sites.length > MAX_SITES) {
-    lines.push("", `...and ${sites.length - MAX_SITES} more offline sites`);
+    blocks.push(`...and ${sites.length - MAX_SITES} more down sites.`);
   }
 
-  const text = lines.join("\n");
+  const text = blocks.join("\n\n");
   return text.length > MAX_TEXT_CHARS
     ? `${text.slice(0, MAX_TEXT_CHARS)}...`
     : text;
 }
 
 /**
+ * Stable fingerprint of one sync cycle's down-site set. Stored durably
+ * (dashboard_cache.notified_hash) so a report goes out once per cycle — not
+ * once per poll — even across serverless instances. The payload's builtAt
+ * rotates the hash every sync, preserving the "report after every sync" cadence.
+ */
+function offlineSitesHash(sites: NotifySite[], builtAt?: number): string {
+  const parts = sites
+    .map((s) => {
+      const devices = s.devices
+        .map((d) => d.serialNumber || d.aliasName || d.name || "")
+        .filter(Boolean)
+        .sort()
+        .join(",");
+      return `${s.groupId}|${s.name}|${s.province || ""}|${s.offlineCount}/${s.totalCount}|${devices}`;
+    })
+    .sort();
+  const material = `${builtAt ?? ""}\n${parts.join("\n")}`;
+  let h = 5381;
+  for (let i = 0; i < material.length; i++) {
+    h = (Math.imul(h, 33) + material.charCodeAt(i)) | 0;
+  }
+  return `v1:${sites.length}:${h}`;
+}
+
+/**
  * Message every contact incharge whose assigned provinces/projects contain
  * any currently-offline site. Never throws — per-contact failures are logged.
- * The caller awaits this (serverless hosts freeze work after the response is
- * written). No-op when TELEGRAM_BOT_TOKEN is unset or there are no offline
- * sites.
+ *
+ * Delivery is claimed against a durable per-cycle fingerprint
+ * (dashboard_cache.notified_hash) so:
+ *   - cache-hit polls do not re-send the same outage on every request, and
+ *   - if a serverless host freezes the post-response after() work mid-send,
+ *     the claim stays unset and the next dashboard request delivers it.
+ *
+ * No-op when TELEGRAM_BOT_TOKEN is unset or there are no offline sites.
  */
 export async function sendOfflineReports(
   userId: string,
-  payload: { offlineSites?: NotifySite[] }
+  payload: { offlineSites?: NotifySite[]; builtAt?: number }
 ): Promise<void> {
   if (!process.env.TELEGRAM_BOT_TOKEN) return;
 
   const sites = (payload.offlineSites || []).filter((s) => s.offlineCount > 0);
   if (sites.length === 0) return;
+  if (notifyingUsers.has(userId)) return;
+  notifyingUsers.add(userId);
 
-  const supabase = getSupabaseServiceRole();
-  const { data: contacts, error } = await supabase
-    .from("contact_incharges")
-    .select("*")
-    .eq("user_id", userId);
-  if (error) {
-    console.warn("Contacts lookup failed:", error.message);
-    return;
-  }
+  try {
+    const supabase = getSupabaseServiceRole();
 
-  for (const contact of contacts || []) {
-    const provinces: string[] = Array.isArray(contact.provinces)
-      ? contact.provinces.map((p: unknown) => String(p).toLowerCase())
-      : [];
-    const projectIds: number[] = Array.isArray(contact.project_ids)
-      ? contact.project_ids
-          .map((p: unknown) => Number(p))
-          .filter((n: number) => Number.isFinite(n))
-      : [];
-    // No assignment — this contact is not in charge of any site.
-    if (provinces.length === 0 && projectIds.length === 0) continue;
+    // Already delivered for this sync cycle?
+    const hash = offlineSitesHash(sites, payload.builtAt);
+    if ((await notifiedHashGet(userId)) === hash) return;
 
-    const scoped = sites.filter(
-      (s) =>
-        (s.province != null && provinces.includes(s.province.toLowerCase())) ||
-        projectIds.includes(s.groupId)
-    );
-    if (scoped.length === 0) {
-      console.warn(
-        `Telegram report skipped for ${contact.name}: ` +
-          "no offline site falls within their assigned provinces/projects"
+    const { data: contacts, error } = await supabase
+      .from("contact_incharges")
+      .select("*")
+      .eq("user_id", userId);
+    if (error) {
+      console.warn("Contacts lookup failed:", error.message);
+      return;
+    }
+
+    const sends: Promise<void>[] = [];
+    for (const contact of contacts || []) {
+      const provinces: string[] = Array.isArray(contact.provinces)
+        ? contact.provinces.map((p: unknown) => String(p).toLowerCase())
+        : [];
+      const projectIds: number[] = Array.isArray(contact.project_ids)
+        ? contact.project_ids
+            .map((p: unknown) => Number(p))
+            .filter((n: number) => Number.isFinite(n))
+        : [];
+      // No assignment — this contact is not in charge of any site.
+      if (provinces.length === 0 && projectIds.length === 0) continue;
+
+      const scoped = sites.filter(
+        (s) =>
+          (s.province != null && provinces.includes(s.province.toLowerCase())) ||
+          projectIds.includes(s.groupId)
       );
-      continue;
-    }
-
-    const resolvedChatId = String(contact.resolved_chat_id || "").trim();
-    const raw = String(contact.telegram_chat_id || "").trim();
-    if (!resolvedChatId && !raw) {
-      console.warn(`Skipping Telegram report for ${contact.name}: no number`);
-      continue;
-    }
-
-    // Prefer the DB-stored chat id (survives serverless cold starts), fall
-    // back to the learned phone→chat map / a fresh inbox scan.
-    const chatId = resolvedChatId || (await resolveTelegramChatId(raw)) || "";
-    if (!chatId) {
-      console.warn(
-        `Telegram report skipped for ${contact.name} (${raw}): ` +
-          "contact has not messaged the bot yet"
-      );
-      continue;
-    }
-    if (!resolvedChatId) {
-      // Backfill so the link outlives the process (Netlify cold starts).
-      const { error: persistError } = await supabase
-        .from("contact_incharges")
-        .update({ resolved_chat_id: chatId })
-        .eq("id", contact.id);
-      if (persistError) {
-        console.warn("Telegram chat-id persist failed:", persistError.message);
+      if (scoped.length === 0) {
+        console.warn(
+          `Telegram report skipped for ${contact.name}: ` +
+            "no offline site falls within their assigned provinces/projects"
+        );
+        continue;
       }
+
+      const resolvedChatId = String(contact.resolved_chat_id || "").trim();
+      const raw = String(contact.telegram_chat_id || "").trim();
+      if (!resolvedChatId && !raw) {
+        console.warn(`Skipping Telegram report for ${contact.name}: no number`);
+        continue;
+      }
+
+      // Prefer the DB-stored chat id (survives serverless cold starts), fall
+      // back to the learned phone→chat map / a fresh inbox scan.
+      const chatId = resolvedChatId || (await resolveTelegramChatId(raw)) || "";
+      if (!chatId) {
+        console.warn(
+          `Telegram report skipped for ${contact.name} (${raw}): ` +
+            "contact has not messaged the bot yet"
+        );
+        continue;
+      }
+      if (!resolvedChatId) {
+        // Backfill so the link outlives the process (Netlify cold starts).
+        const { error: persistError } = await supabase
+          .from("contact_incharges")
+          .update({ resolved_chat_id: chatId })
+          .eq("id", contact.id);
+        if (persistError) {
+          console.warn("Telegram chat-id persist failed:", persistError.message);
+        }
+      }
+
+      sends.push(
+        sendTelegramMessage(chatId, buildMonitoringReport(scoped))
+          .then(() => {
+            console.log(
+              `Telegram report sent to ${contact.name} (${chatId}) — ` +
+                `${scoped.length} offline site(s)`
+            );
+          })
+          .catch((e) => {
+            console.warn(
+              `Telegram report failed for ${contact.name} (${raw}):`,
+              e instanceof Error ? e.message : e
+            );
+          })
+      );
     }
 
-    try {
-      await sendTelegramMessage(chatId, buildMonitoringReport(scoped));
-      console.log(
-        `Telegram report sent to ${contact.name} (${chatId}) — ` +
-          `${scoped.length} offline site(s)`
-      );
-    } catch (e) {
-      console.warn(
-        `Telegram report failed for ${contact.name} (${raw}):`,
-        e instanceof Error ? e.message : e
-      );
-    }
+    // Parallel: N contacts must not serialize into N × timeout on serverless.
+    await Promise.allSettled(sends);
+    // Claim the cycle after the attempt — a host that freezes the function
+    // mid-send leaves the claim unset, so the next request retries.
+    await notifiedHashSet(userId, hash);
+  } finally {
+    notifyingUsers.delete(userId);
   }
 }

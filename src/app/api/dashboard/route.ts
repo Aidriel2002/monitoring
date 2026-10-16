@@ -3,6 +3,11 @@ import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheFetch, cacheClear, cacheGet, cacheSet } from "@/lib/cache";
 import { diskGet, diskSet } from "@/lib/disk-cache";
 import {
+  durableLoad,
+  durableSave,
+  durableClear,
+} from "@/lib/dashboard-cache";
+import {
   getProjects,
   fetchProjectTree,
   getFleetDevices,
@@ -18,8 +23,10 @@ import {
   RuijieProject,
   RuijieDevice,
   RuijieWarnLog,
+  ProjectTreeNode,
 } from "@/lib/ruijie";
 import { reverseGeocodeProvince, geocodeSiteName, isValidSiteGeo } from "@/lib/geo";
+import { parseProjectsCache } from "@/lib/projects-cache";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 import { processTelegramInbox, sendOfflineReports } from "@/lib/notify";
 
@@ -231,12 +238,10 @@ export async function GET(request: Request) {
     // current credential set instead of serving stale sites for the rest of
     // the 100-minute cycle — unless we're inside a rate-limit hold.
     if (cached && !coolingCred) {
-      const cachedIds = cached.credentialIds;
-      const credsChanged =
-        !cachedIds ||
-        cachedIds.length !== creds.length ||
-        creds.some((c) => !cachedIds.includes(c.id));
-      if (credsChanged) cacheClear(cacheKey);
+      if (!credentialSetMatches(cached.credentialIds, creds)) {
+        cacheClear(cacheKey);
+        await durableClear(user.id);
+      }
     }
 
     // Refresh button: reset the 100m status window and rebuild immediately.
@@ -255,26 +260,48 @@ export async function GET(request: Request) {
         });
       }
       cacheClear(cacheKey);
+      await durableClear(user.id);
     }
 
     // One shared payload per user — concurrent tab polls hit memory, not Ruijie.
     // Degraded / rate-limited results get a short TTL so they self-heal.
     // The loader ONLY builds the payload. Post-rebuild side effects (realtime
-    // broadcast, Telegram outage reports) run via after() below so the HTTP
-    // response is never blocked on them — critical on serverless hosts (Netlify)
-    // where awaiting Telegram before responding pushes the function past its
-    // timeout and the gateway returns 502.
+    // broadcast) run via after() below so the HTTP response is never blocked
+    // on them — critical on serverless hosts (Netlify) where awaiting work
+    // before responding pushes the function past its timeout (502s).
     let rebuilt = false;
-    const payload =
-      coolingCred && cached
-        ? cached
-        : await cacheFetch(cacheKey, DASHBOARD_TTL_MS, async () => {
-            rebuilt = true;
-            return buildDashboard(creds, {
-              forceGeo: forceStatus,
-              prev: cached,
-            });
-          });
+    let payload: DashboardPayload | undefined;
+    if (coolingCred && cached) {
+      // Rate-limit hold: serve the last payload, make no Ruijie calls.
+      payload = cached;
+    }
+    if (!payload) {
+      // Durable Supabase copy — cold starts on serverless answer instantly
+      // from the last healthy payload instead of redoing the full rebuild
+      // (which on Netlify is tens of seconds of sequential Ruijie calls).
+      const durable = await durableLoad<DashboardPayload>(user.id);
+      if (
+        durable &&
+        Date.now() - durable.builtAtMs < DASHBOARD_TTL_MS &&
+        credentialSetMatches(durable.payload.credentialIds, creds)
+      ) {
+        const remaining = Math.max(
+          DASHBOARD_TTL_MS - (Date.now() - durable.builtAtMs),
+          60_000
+        );
+        cacheSet(cacheKey, durable.payload, remaining);
+        payload = durable.payload;
+      }
+    }
+    if (!payload) {
+      payload = await cacheFetch(cacheKey, DASHBOARD_TTL_MS, async () => {
+        rebuilt = true;
+        return buildDashboard(creds, {
+          forceGeo: forceStatus,
+          prev: cached,
+        });
+      });
+    }
 
     // Overlay live cooldown state on every response — even when the dashboard
     // cache still holds a "healthy" payload from before code 44.
@@ -313,13 +340,34 @@ export async function GET(request: Request) {
     if (ttl < DASHBOARD_TTL_MS) {
       cacheSet(cacheKey, response, ttl);
     }
+    // Persist fresh healthy builds durably (before responding — after() can be
+    // cut off on serverless and the next cold start depends on this row).
+    if (rebuilt && ttl === DASHBOARD_TTL_MS) {
+      await durableSave(user.id, payload);
+    }
+
+    // Telegram outage report. The claim (durable notified_hash, checked inside
+    // sendOfflineReports) guarantees one report per sync cycle:
+    //   - rebuilt cycles send from after() — Telegram before the response is
+    //     what caused Netlify 502s on top of a long rebuild;
+    //   - cache-hit polls send inline (bounded): if a host froze after()
+    //     before the report went out, the next poll delivers it.
+    if (!rebuilt) {
+      await Promise.race([
+        sendOfflineReports(user.id, payload).catch(() => undefined),
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, 12_000);
+          (t as NodeJS.Timeout).unref?.();
+        }),
+      ]);
+    }
 
     // Post-response side effects — scheduled via after() so the HTTP response
     // is returned immediately and the work is kept alive to completion. Awaiting
-    // any of these before responding is what caused Netlify 502s: Telegram +
-    // realtime calls can take seconds, and the function gateway kills the
-    // request when it exceeds its timeout. after() runs them after the response
-    // is flushed but does not freeze them (unlike fire-and-forget void).
+    // any of these before responding is what caused Netlify 502s: realtime
+    // calls can take seconds, and the function gateway kills the request when
+    // it exceeds its timeout. after() runs them after the response is flushed
+    // but does not freeze them (unlike fire-and-forget void).
     after(async () => {
       if (rebuilt) {
         // Push fresh data (and limit flags) to open dashboards — realtime costs
@@ -328,8 +376,10 @@ export async function GET(request: Request) {
           rateLimitedCredentials: payload.rateLimitedCredentials,
           degraded: payload.degraded,
         }).catch(() => undefined);
-        // Telegram outage report to contact incharges — runs only on fresh
-        // rebuilds: the 100-min TTL expiry and manual Sync Data.
+        // Telegram outage report to contact incharges — runs on fresh
+        // rebuilds: the 100-min TTL expiry and manual Sync Data. If the host
+        // freezes this work, the claim stays unset and the next cache-hit
+        // poll re-sends (see the inline branch above).
         await sendOfflineReports(user.id, payload).catch((e) =>
           console.warn(
             "Offline notifications failed:",
@@ -364,6 +414,7 @@ type CredentialRow = {
   base_url: string | null;
   selected_group_ids: number[] | null;
   selected_received_group_ids: number[] | null;
+  projects_cache?: unknown;
 };
 
 function toRuijieCreds(cred: CredentialRow): RuijieCredentials {
@@ -383,6 +434,20 @@ interface DashboardPayload {
   degraded: boolean;
   /** Credential set the payload was built from — used to detect enable/disable changes. */
   credentialIds?: string[];
+  /** When this payload was built — rotates the Telegram report claim each cycle. */
+  builtAt?: number;
+}
+
+/** True when the payload's credential set is exactly the currently-enabled set. */
+function credentialSetMatches(
+  ids: string[] | undefined,
+  creds: CredentialRow[]
+): boolean {
+  return (
+    Array.isArray(ids) &&
+    ids.length === creds.length &&
+    creds.every((c) => ids.includes(c.id))
+  );
 }
 
 /**
@@ -789,7 +854,19 @@ async function buildDashboard(
         // expandSelectionToLeaves returns null when every leaf is selected.
         let projects = allProjectsFromCred;
         if (selectedIds !== null) {
-          const { tree } = await fetchProjectTree(credentials);
+          // Live tree is ideal, but a cold start / transient failure must not
+          // drop the credential's sites — fall back to the snapshot persisted
+          // by Settings → Sync devices so the saved selection still applies.
+          let tree: ProjectTreeNode[] | undefined;
+          try {
+            ({ tree } = await fetchProjectTree(credentials));
+          } catch (treeErr) {
+            if (isRateLimitError(treeErr)) throw treeErr;
+            tree = parseProjectsCache(cred.projects_cache)?.tree;
+          }
+          if (!tree) {
+            throw new Error("Project tree unavailable");
+          }
           const expanded = expandSelectionToLeaves(tree, selectedIds);
           if (expanded === null) {
             projects = allProjectsFromCred;
@@ -1031,5 +1108,6 @@ async function buildDashboard(
       rateLimitedCredentials,
       degraded,
       credentialIds: creds.map((c) => c.id),
+      builtAt: Date.now(),
     };
 }

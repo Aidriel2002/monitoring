@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheClear } from "@/lib/cache";
+import { durableClear } from "@/lib/dashboard-cache";
 import { expandSelectionToLeaves, fetchProjectTree } from "@/lib/ruijie";
+import { parseProjectsCache } from "@/lib/projects-cache";
 
 async function getUser(request: Request) {
   const cookieHeader = request.headers.get("cookie") || "";
@@ -30,7 +32,7 @@ export async function GET(request: Request) {
     const supabase = getSupabaseServiceRole();
     const { data, error } = await supabase
       .from("api_credentials")
-      .select("id, name, app_id, secret, bootstrap_token, base_url, is_active, created_at, selected_group_ids, selected_received_group_ids")
+      .select("id, name, app_id, secret, bootstrap_token, base_url, is_active, created_at, selected_group_ids, selected_received_group_ids, projects_cache")
       .eq("user_id", user.id)
       .order("created_at", { ascending: false });
 
@@ -41,10 +43,17 @@ export async function GET(request: Request) {
     // Expand legacy parent IDs → leaf IDs so the UI label/count matches the tree.
     const credentials = await Promise.all(
       (data || []).map(async (cred) => {
-        const { secret, bootstrap_token, base_url, ...pub } = cred as {
+        const {
+          secret,
+          bootstrap_token,
+          base_url,
+          projects_cache,
+          ...pub
+        } = cred as {
           secret: string;
           bootstrap_token: string | null;
           base_url: string | null;
+          projects_cache?: unknown;
         } & Record<string, unknown>;
         if (cred.selected_group_ids === null || cred.selected_group_ids === undefined) {
           return pub;
@@ -52,12 +61,18 @@ export async function GET(request: Request) {
         // Disabled credentials are never called — no tree expansion either.
         if (cred.is_active === false) return pub;
         try {
-          const { tree } = await fetchProjectTree({
-            appId: cred.app_id as string,
-            secret,
-            bootstrapToken: bootstrap_token || undefined,
-            baseUrl: base_url || undefined,
-          });
+          // Prefer the snapshot persisted by Sync devices — hitting Ruijie's
+          // live tree on every Settings load burned quota, and a failure
+          // silently made the UI show (and re-save) "All projects".
+          const cachedTree = parseProjectsCache(projects_cache)?.tree;
+          const { tree } = cachedTree
+            ? { tree: cachedTree }
+            : await fetchProjectTree({
+                appId: cred.app_id as string,
+                secret,
+                bootstrapToken: bootstrap_token || undefined,
+                baseUrl: base_url || undefined,
+              });
           return {
             ...pub,
             selected_group_ids: expandSelectionToLeaves(
@@ -66,6 +81,8 @@ export async function GET(request: Request) {
             ),
           };
         } catch {
+          // Tree unavailable — keep the raw saved selection (pub already
+          // carries it) rather than reporting "all" for a saved subset.
           return pub;
         }
       })
@@ -156,8 +173,10 @@ export async function PATCH(request: Request) {
       );
     }
 
-    // A disabled credential must disappear from the dashboard immediately.
+    // A disabled credential must disappear from the dashboard immediately —
+    // clear both the per-instance memory cache and the durable Supabase copy.
     cacheClear(`dashboard:${user.id}`);
+    await durableClear(user.id);
 
     return NextResponse.json({ success: true, isActive: data.is_active });
   } catch {

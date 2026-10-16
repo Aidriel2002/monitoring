@@ -10,7 +10,10 @@
 #   NEXT_PUBLIC_SUPABASE_URL
 #   NEXT_PUBLIC_SUPABASE_ANON_KEY
 #   SUPABASE_SERVICE_ROLE_KEY
-#   TELEGRAM_BOT_TOKEN          (optional — enables outage reports)
+#   TELEGRAM_BOT_TOKEN          (required for outage reports — the bot will
+#                                NOT send downsite alerts online without it;
+#                                also run supabase/migration_v9.sql and
+#                                supabase/migration_v10.sql once)
 
 [build]
   command = "npm run build"

@@ -8,6 +8,7 @@ import {
 } from "@/lib/cache";
 import { diskGet, diskSet, diskDelete } from "@/lib/disk-cache";
 import { isValidSiteGeo } from "@/lib/geo";
+import { getSupabaseServiceRole } from "@/lib/supabase";
 import { appendFileSync, existsSync } from "node:fs";
 import nodePath from "node:path";
 
@@ -587,6 +588,52 @@ function persistDeviceStore(store: DeviceStore): void {
   cacheSet(memKey, payload, TTL_DEVICE_META_MS);
   // Survive server restarts so Settings → Sync devices is not needed every boot.
   diskSet(memKey, payload);
+  // Durable Supabase copy — Netlify's filesystem is read-only/ephemeral, so
+  // without it every cold start loses the inventory and drops all owned sites.
+  deviceStoreDbSet(store.key, payload);
+}
+
+const DEVICE_STORE_TABLE = "device_stores";
+
+/** Durable copy of one credential's device store (Supabase). */
+async function deviceStoreDbGet(
+  key: string
+): Promise<PersistedDeviceStore | undefined> {
+  try {
+    const sb = getSupabaseServiceRole();
+    const { data, error } = await sb
+      .from(DEVICE_STORE_TABLE)
+      .select("store")
+      .eq("key", key)
+      .maybeSingle();
+    if (error || !data?.store) return undefined;
+    const s = data.store as PersistedDeviceStore;
+    return Array.isArray(s?.meta) && Array.isArray(s?.status)
+      ? s
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Fire-and-forget upsert — the in-memory/disk layers already cover this call. */
+function deviceStoreDbSet(key: string, payload: PersistedDeviceStore): void {
+  try {
+    const sb = getSupabaseServiceRole();
+    void Promise.resolve(
+      sb
+        .from(DEVICE_STORE_TABLE)
+        .upsert({
+          key,
+          store: payload,
+          stored_at: new Date().toISOString(),
+        })
+    )
+      .then(() => undefined)
+      .catch(() => undefined);
+  } catch {
+    // env not ready / table missing — ignore, memory + disk still hold it
+  }
 }
 
 function loadPersistedDeviceStore(key: string): PersistedDeviceStore | undefined {
@@ -832,6 +879,21 @@ export async function getFleetDevices(
 ): Promise<RuijieDevice[]> {
   const mode = opts?.mode ?? "status";
   const store = getDeviceStore(creds);
+
+  // Cold instance with an empty store (Netlify: memory died, disk is
+  // read-only) — hydrate from the durable Supabase copy before deciding the
+  // store has no inventory. Without this every owned site got totalCount 0
+  // and vanished from the dashboard after a refresh.
+  if (store.meta.size === 0) {
+    const durable = await deviceStoreDbGet(credKey(creds));
+    if (durable?.meta?.length) {
+      store.meta = new Map(durable.meta);
+      store.status = new Map(durable.status);
+      store.statusCheckedAt = durable.statusCheckedAt || 0;
+      // Rehydrate the local layers so later calls skip the DB round-trip.
+      cacheSet(deviceStoreDiskKey(store.key), durable, TTL_DEVICE_META_MS);
+    }
+  }
 
   if (mode === "status") {
     if (isStatusFresh(store)) {
