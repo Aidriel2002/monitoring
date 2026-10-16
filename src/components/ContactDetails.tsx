@@ -431,9 +431,9 @@ export default function ContactDetails() {
             Contact Incharges ({contacts.length})
           </h2>
           <p className="mt-1 text-sm text-gray-500">
-            Receive a Telegram monitoring report after every sync (100 min) and
-            on manual sync. Contacts with no province or project assigned
-            receive no reports.
+            Receive a Telegram report when sites go down (checked every 10 min,
+            unchanged outages re-reported at most hourly) and on manual sync.
+            Contacts with no province or project assigned receive no reports.
           </p>
         </div>
         <button

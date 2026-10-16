@@ -78,10 +78,11 @@ function getGMT8Date(): string {
   });
 }
 
-const NEXT_REFRESH_KEY = "dashboard:nextRefreshAt";
+/** v2: versioned so a window saved by the old 100-min build is ignored. */
+const NEXT_REFRESH_KEY = "dashboard:nextRefreshAt:v2";
 const MANUAL_REFRESH_KEY = "dashboard:manualRefreshAt";
 /** Fallback countdown (seconds) until the server reports statusIntervalSeconds. */
-const DEFAULT_INTERVAL_SECONDS = 100 * 60;
+const DEFAULT_INTERVAL_SECONDS = 10 * 60;
 /** Re-check while a credential is cooling down — server answers from cache. */
 const FAST_POLL_SECONDS = 60;
 /** Manual Sync Data / spam guard: at most one force sync per minute. */
@@ -440,6 +441,16 @@ export default function Dashboard() {
         typeof dashData.statusIntervalSeconds === "number"
           ? dashData.statusIntervalSeconds
           : DEFAULT_INTERVAL_SECONDS;
+      // Remaining server-cache window (falls back to the full interval).
+      // Counting THIS down instead of a fresh full interval keeps the client
+      // deadline aligned with the server's real expiry — the fetch at 0 then
+      // actually rebuilds. With a full-interval countdown, drift made the
+      // countdown-end sync hit a still-fresh server cache: no rebuild, no new
+      // sites/devices fetched (seen on Netlify).
+      const updateIn =
+        typeof dashData.nextUpdateInSeconds === "number"
+          ? dashData.nextUpdateInSeconds
+          : interval;
       const now = Date.now();
       let next = readNextRefreshAt();
       if (limited.length > 0) {
@@ -451,9 +462,9 @@ export default function Dashboard() {
         setLastRefresh(new Date(now));
       } else if (force || !next || next <= now) {
         // Keep the running window across page switches unless forced or expired.
-        next = now + interval * 1000;
+        next = now + updateIn * 1000;
         writeNextRefreshAt(next);
-        setLastRefresh(new Date(next - interval * 1000));
+        setLastRefresh(new Date(next - updateIn * 1000));
       }
       setRefreshCountdown(secondsUntil(next));
     } catch (error) {
@@ -480,7 +491,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchAll();
-    // Auto status check every 100m (matches server status TTL).
+    // Auto status check every 10m (matches server status TTL).
     const poll = setInterval(() => fetchAll(), DEFAULT_INTERVAL_SECONDS * 1000);
     const whenDue = setInterval(() => {
       const next = readNextRefreshAt();

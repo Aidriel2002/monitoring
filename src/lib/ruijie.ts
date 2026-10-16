@@ -33,16 +33,22 @@ export interface RuijieCredentials {
 const DEFAULT_BASE_URL = "https://cloud-as.ruijienetworks.com";
 const DEFAULT_BOOTSTRAP_TOKEN = "d63dss0a81e4415a889ac5b78fsc904a";
 
-// TTLs: online/offline status every 100m; device meta + site tree only via
+// TTLs: online/offline status every 10m; device meta + site tree only via
 // Settings → Fetch devices (long TTL, cleared by invalidateCredentialCaches).
-// Budget (steady-state, dashboard open): status fleet ≈ 2 creds × ~15/day
-//   + received/warns 100m each → far under 5k/day.
-const STATUS_INTERVAL_MS = 100 * 60_000;
+// Budget (steady-state, dashboard open), per credential:
+//   status fleet ≈ ceil(devices/200) × 144/day + received 144/day
+//   + tree (cold rebuilds) + warns (6h) → far under the 5k/day app quota.
+const STATUS_INTERVAL_MS = 10 * 60_000;
 const TTL_TREE_MS = 7 * 24 * 60 * 60_000;
 const TTL_RECEIVED_MS = STATUS_INTERVAL_MS;
 const TTL_DEVICE_STATUS_MS = STATUS_INTERVAL_MS;
 const TTL_DEVICE_META_MS = 7 * 24 * 60 * 60_000;
-const TTL_WARN_MS = STATUS_INTERVAL_MS;
+/**
+ * Warn logs are decoupled from the status cycle: at a 10-minute sync cadence,
+ * a status-linked TTL would refetch up to 3 warnlog pages per offline shared
+ * group 144×/day (cold instances lose the module cache) — 6h bounds that.
+ */
+const TTL_WARN_MS = 6 * 60 * 60_000;
 
 export const DEVICE_STATUS_INTERVAL_SECONDS = Math.floor(STATUS_INTERVAL_MS / 1000);
 
@@ -867,7 +873,7 @@ async function fetchFleetRaw(
 /**
  * One paginated call for the whole account (root group).
  *
- * mode "status" (default): every 100m (or after invalidateDeviceStatus) refresh
+ * mode "status" (default): every 10m (or after invalidateDeviceStatus) refresh
  * online/offline only — never writes device meta (name/IP/etc.).
  * Device inventory identity is loaded only via mode "meta" (Settings → Fetch devices).
  *
@@ -895,14 +901,8 @@ export async function getFleetDevices(
     }
   }
 
-  if (mode === "status") {
-    if (isStatusFresh(store)) {
-      return mergeStore(store);
-    }
-    // Status cycles must not discover/build inventory — Fetch devices only.
-    if (store.meta.size === 0) {
-      return [];
-    }
+  if (mode === "status" && isStatusFresh(store)) {
+    return mergeStore(store);
   }
 
   // Live check must not reuse a long-lived raw snapshot.
@@ -912,13 +912,20 @@ export async function getFleetDevices(
     const { value: fleet, stale } = await fetchFleetRaw(creds);
     // Stale-on-error must not mark status as freshly checked.
     if (!stale) {
-      if (mode === "meta") {
+      // An empty store (cold start with no durable copy yet) must build the
+      // full inventory — returning [] made every owned site vanish from the
+      // dashboard until someone pressed Sync devices. The fleet call cost is
+      // identical to a status refresh.
+      if (mode === "meta" || store.meta.size === 0) {
         applyFleetToStore(store, fleet);
       } else {
         // Status cycle: online/offline only — never write name/IP/meta.
         applyFleetStatusOnly(store, fleet);
       }
-    } else if (store.status.size === 0 && mode === "meta") {
+    } else if (
+      store.status.size === 0 &&
+      (mode === "meta" || store.meta.size === 0)
+    ) {
       applyFleetToStore(store, fleet);
       store.statusCheckedAt = Date.now() - TTL_DEVICE_STATUS_MS;
     }

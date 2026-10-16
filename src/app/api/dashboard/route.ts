@@ -30,8 +30,14 @@ import { parseProjectsCache } from "@/lib/projects-cache";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 import { processTelegramInbox, sendOfflineReports } from "@/lib/notify";
 
-/** Healthy payload matches the 100m status cycle; limited/degraded re-seat to 15s. */
+/** Healthy payload matches the 10m status cycle; limited/degraded re-seat to 15s. */
 const DASHBOARD_TTL_MS = DEVICE_STATUS_INTERVAL_SECONDS * 1000;
+/**
+ * How long a known-good payload may back a degraded rebuild (fleet/tree
+ * failure) instead of blanking the dashboard. Bounded so genuinely-gone
+ * data still disappears within a workday.
+ */
+const STALE_DASHBOARD_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Warn-log rows are reused between cycles while a group's offline count is
@@ -41,7 +47,7 @@ const WARN_LOG_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Cross-build warn-log store (module scope — must outlive a single request).
- * Without it every 100-minute rebuild re-queried every offline shared group
+ * Without it every rebuild re-queried every offline shared group
  * (~15-30 calls) even though nothing had changed.
  */
 const warnLogsByGroup = new Map<
@@ -236,7 +242,7 @@ export async function GET(request: Request) {
     // in-memory cache is per-instance on serverless, so a toggle on another
     // instance never cleared this one). Rebuild immediately against the
     // current credential set instead of serving stale sites for the rest of
-    // the 100-minute cycle — unless we're inside a rate-limit hold.
+    // the current cycle — unless we're inside a rate-limit hold.
     if (cached && !coolingCred) {
       if (!credentialSetMatches(cached.credentialIds, creds)) {
         cacheClear(cacheKey);
@@ -244,7 +250,7 @@ export async function GET(request: Request) {
       }
     }
 
-    // Refresh button: reset the 100m status window and rebuild immediately.
+    // Refresh button: reset the status window and rebuild immediately.
     // Not while cooling down — there is nothing to refresh, the calls would
     // only earn more code 44s (Sync Data falls back to the last payload).
     const forceStatus =
@@ -301,6 +307,20 @@ export async function GET(request: Request) {
           prev: cached,
         });
       });
+      // A degraded rebuild (fleet/tree failure) must not blank a dashboard
+      // that had sites — fall back to the last known-good durable payload.
+      if (rebuilt && payload.degraded) {
+        const stale = await durableLoad<DashboardPayload>(user.id);
+        if (
+          stale &&
+          Array.isArray(stale.payload.projects) &&
+          stale.payload.projects.length > 0 &&
+          credentialSetMatches(stale.payload.credentialIds, creds) &&
+          Date.now() - stale.builtAtMs <= STALE_DASHBOARD_MAX_AGE_MS
+        ) {
+          payload = stale.payload;
+        }
+      }
     }
 
     // Overlay live cooldown state on every response — even when the dashboard
@@ -377,7 +397,7 @@ export async function GET(request: Request) {
           degraded: payload.degraded,
         }).catch(() => undefined);
         // Telegram outage report to contact incharges — runs on fresh
-        // rebuilds: the 100-min TTL expiry and manual Sync Data. If the host
+        // rebuilds: the status-TTL expiry and manual Sync Data. If the host
         // freezes this work, the claim stays unset and the next cache-hit
         // poll re-sends (see the inline branch above).
         await sendOfflineReports(user.id, payload).catch((e) =>
@@ -393,9 +413,22 @@ export async function GET(request: Request) {
       await processTelegramInbox().catch(() => undefined);
     });
 
+    // Remaining cache window — the client counts THIS down so its zero lands
+    // on the server's actual expiry. A full-interval countdown drifts ahead of
+    // the cache age; at zero it hit a still-fresh cache and served no rebuild
+    // (no new sites/devices fetched, most visible on Netlify). 15s floor so a
+    // stale-on-error payload cannot pin the client into a per-second loop.
+    const builtAtMs =
+      typeof payload.builtAt === "number" ? payload.builtAt : Date.now();
+    const nextUpdateInSeconds = Math.max(
+      15,
+      Math.ceil((builtAtMs + ttl - Date.now()) / 1000)
+    );
+
     return NextResponse.json({
       ...response,
       statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+      nextUpdateInSeconds,
     });
   } catch (error) {
     return NextResponse.json(

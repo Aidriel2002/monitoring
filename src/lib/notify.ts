@@ -14,6 +14,12 @@ const INBOX_SCAN_MIN_INTERVAL_MS = 60_000;
 let lastInboxScanAt = 0;
 /** One in-flight report per user per instance (parallel polls dedupe here). */
 const notifyingUsers = new Set<string>();
+/**
+ * An unchanged down-set is re-reported at most this often. Sync cycles are
+ * 10 minutes — without this floor a site down for a day would generate 144
+ * identical Telegram reports per contact.
+ */
+const MIN_REPORT_REPEAT_MS = 60 * 60_000;
 
 interface InboxUpdate {
   update_id: number;
@@ -281,12 +287,12 @@ export function buildMonitoringReport(sites: NotifySite[]): string {
 }
 
 /**
- * Stable fingerprint of one sync cycle's down-site set. Stored durably
- * (dashboard_cache.notified_hash) so a report goes out once per cycle — not
- * once per poll — even across serverless instances. The payload's builtAt
- * rotates the hash every sync, preserving the "report after every sync" cadence.
+ * Stable fingerprint of one sync's down-site set. Stored durably as
+ * `hash@sentAt` (dashboard_cache.notified_hash) so a report goes out when the
+ * down-set CHANGES, and the same unchanged set is not re-sent more often than
+ * MIN_REPORT_REPEAT_MS — even across serverless instances and 10-min cycles.
  */
-function offlineSitesHash(sites: NotifySite[], builtAt?: number): string {
+function offlineSitesHash(sites: NotifySite[]): string {
   const parts = sites
     .map((s) => {
       const devices = s.devices
@@ -297,7 +303,7 @@ function offlineSitesHash(sites: NotifySite[], builtAt?: number): string {
       return `${s.groupId}|${s.name}|${s.province || ""}|${s.offlineCount}/${s.totalCount}|${devices}`;
     })
     .sort();
-  const material = `${builtAt ?? ""}\n${parts.join("\n")}`;
+  const material = parts.join("\n");
   let h = 5381;
   for (let i = 0; i < material.length; i++) {
     h = (Math.imul(h, 33) + material.charCodeAt(i)) | 0;
@@ -309,9 +315,10 @@ function offlineSitesHash(sites: NotifySite[], builtAt?: number): string {
  * Message every contact incharge whose assigned provinces/projects contain
  * any currently-offline site. Never throws — per-contact failures are logged.
  *
- * Delivery is claimed against a durable per-cycle fingerprint
+ * Delivery is claimed against a durable down-set fingerprint
  * (dashboard_cache.notified_hash) so:
  *   - cache-hit polls do not re-send the same outage on every request, and
+ *   - an unchanged down-set is re-sent at most once per hour (10-min cycles),
  *   - if a serverless host freezes the post-response after() work mid-send,
  *     the claim stays unset and the next dashboard request delivers it.
  *
@@ -319,7 +326,7 @@ function offlineSitesHash(sites: NotifySite[], builtAt?: number): string {
  */
 export async function sendOfflineReports(
   userId: string,
-  payload: { offlineSites?: NotifySite[]; builtAt?: number }
+  payload: { offlineSites?: NotifySite[] }
 ): Promise<void> {
   if (!process.env.TELEGRAM_BOT_TOKEN) return;
 
@@ -331,9 +338,17 @@ export async function sendOfflineReports(
   try {
     const supabase = getSupabaseServiceRole();
 
-    // Already delivered for this sync cycle?
-    const hash = offlineSitesHash(sites, payload.builtAt);
-    if ((await notifiedHashGet(userId)) === hash) return;
+    // Already reported this down-set recently? (Format: "hash@sentAt";
+    // old-format values have no "@", sentAt 0 → one re-send after deploy.)
+    const hash = offlineSitesHash(sites);
+    const previous = await notifiedHashGet(userId);
+    if (previous) {
+      const [prevHash, sentAtRaw] = previous.split("@");
+      const sentAt = Number(sentAtRaw) || 0;
+      if (prevHash === hash && Date.now() - sentAt < MIN_REPORT_REPEAT_MS) {
+        return;
+      }
+    }
 
     const { data: contacts, error } = await supabase
       .from("contact_incharges")
@@ -417,9 +432,10 @@ export async function sendOfflineReports(
 
     // Parallel: N contacts must not serialize into N × timeout on serverless.
     await Promise.allSettled(sends);
-    // Claim the cycle after the attempt — a host that freezes the function
-    // mid-send leaves the claim unset, so the next request retries.
-    await notifiedHashSet(userId, hash);
+    // Claim the attempt (hash + sent-at) after trying — a host that freezes
+    // the function mid-send leaves the claim unset, so the next request
+    // retries; the timestamp throttles re-sends of an unchanged down-set.
+    await notifiedHashSet(userId, `${hash}@${Date.now()}`);
   } finally {
     notifyingUsers.delete(userId);
   }

@@ -4,7 +4,7 @@ import { cacheClear } from "@/lib/cache";
 import { invalidateDeviceStatus } from "@/lib/ruijie";
 
 /**
- * TEMPORARY: expires exactly the resources that share the 100-minute status
+ * TEMPORARY: expires exactly the resources that share the status-cycle
  * window, so the next dashboard request measures a real refresh cycle.
  */
 export async function GET() {
