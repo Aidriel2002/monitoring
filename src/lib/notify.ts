@@ -49,6 +49,8 @@ export interface NotifySite {
   credentialName?: string;
   offlineCount: number;
   totalCount: number;
+  /** Epoch ms when the site went offline (oldest device's lastOnline). */
+  oldestOffline?: number;
   devices: NotifyDevice[];
 }
 
@@ -266,6 +268,21 @@ export async function sendTelegramMessage(
   }
 }
 
+/** Human-readable downtime since an epoch-ms timestamp ("3d 5h", "2h 10m"). */
+function formatDowntime(lastOnline: number): string {
+  if (!lastOnline) return "";
+  const ms = Date.now() - lastOnline;
+  if (ms < 0) return "Just now";
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return `${days}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${seconds}s`;
+}
+
 /**
  * Build the monitoring report text — grouped project → province → site, with
  * a blank line between every element:
@@ -276,8 +293,8 @@ export async function sendTelegramMessage(
  *
  *   Province
  *
- *   * Site A
- *   * Site B
+ *   * Site A (3d 5h)
+ *   * Site B (2h 10m)
  */
 export function buildMonitoringReport(
   sites: NotifySite[],
@@ -305,7 +322,8 @@ export function buildMonitoringReport(
     for (const [province, provSites] of byProvince) {
       blocks.push(province);
       for (const site of provSites) {
-        blocks.push(`* ${site.name}`);
+        const downtime = formatDowntime(site.oldestOffline || 0);
+        blocks.push(`* ${site.name}${downtime ? ` (${downtime})` : ""}`);
       }
     }
   }

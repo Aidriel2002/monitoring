@@ -538,19 +538,10 @@ export async function GET(request: Request) {
       cacheSet(cacheKey, response, ttl);
     }
 
-    // Remaining cache window — the client counts THIS down so its zero lands
-    // on the server's actual expiry. A full-interval countdown drifts ahead of
-    // the cache age; at zero it hit a still-fresh cache and served no rebuild
-    // (no new sites/devices fetched, most visible on Netlify). 15s floor so a
-    // stale-on-error payload cannot pin the client into a per-second loop.
-    const builtAtMs =
-      typeof payload.builtAt === "number" ? payload.builtAt : Date.now();
-    const nextUpdateInSeconds = rebuilding
-      ? REVALIDATE_POLL_SECONDS
-      : Math.max(
-          15,
-          Math.ceil((builtAtMs + ttl - Date.now()) / 1000)
-        );
+    // Always report the full status interval so the visible countdown is a
+    // steady 10 minutes. (A "remaining cache window" countdown made the timer
+    // shrink to 30s after rebuilds/rate-limit holds, which looked broken.)
+    const nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
 
     return NextResponse.json({
       ...response,

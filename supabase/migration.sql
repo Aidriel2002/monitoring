@@ -16,7 +16,7 @@ CREATE TABLE alarms (
   message TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT now(),
   resolved_at TIMESTAMPTZ
-);
+);  
 
 CREATE INDEX idx_alarms_alarm_type ON alarms(alarm_type);
 CREATE INDEX idx_alarms_resolved_at ON alarms(resolved_at);
