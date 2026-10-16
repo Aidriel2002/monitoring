@@ -628,8 +628,12 @@ function credentialSetMatches(
 }
 
 /**
- * Merge in-memory cooldown state into a (possibly cached) dashboard payload
- * and hide projects for any credential that is currently limited.
+ * Merge in-memory cooldown state into a (possibly cached) dashboard payload.
+ *
+ * Only DISABLED credentials are filtered out. A rate-limited credential keeps
+ * showing its last-known sites — flagged via `rateLimitedCredentials` — because
+ * hiding them made the dashboard look like sudden data loss the moment a quota
+ * ran out. Last-known status with a visible quota banner is the accurate answer.
  */
 function applyLiveRateLimits(
   payload: DashboardPayload,
@@ -655,12 +659,12 @@ function applyLiveRateLimits(
       ? rateLimitedCredentials
       : (payload.rateLimitedCredentials || []);
 
-  const limitedIds = new Set(limitedCreds.map((r) => r.id));
   // `creds` is the currently-enabled set — sites from a credential that has
   // since been disabled must not be served even from a stale cached payload.
+  // Rate-limited credentials are deliberately NOT hidden (see doc comment).
   const activeIds = new Set(creds.map((c) => c.id));
   const visible = (credentialId?: string) =>
-    activeIds.has(credentialId || "") && !limitedIds.has(credentialId || "");
+    activeIds.has(credentialId || "");
   const projects = (payload.projects || []).filter((p) => visible(p.credentialId));
   const offlineDevices = (payload.offlineDevices || []).filter((d) =>
     visible(d.credentialId)
@@ -709,8 +713,14 @@ async function buildDashboard(
       if (status.limited) markLimited(cred, status.retryInSeconds);
     }
 
-    const dropLimitedProjects = () => {
+    // A rate-limited credential can contribute no fresh data (its calls throw
+    // immediately during cooldown). Instead of dropping its sites — which made
+    // the dashboard look like sudden data loss — replace whatever the build
+    // produced for it with the last-known payload's rows. They stay visible,
+    // flagged via rateLimitedCredentials, until the quota window resets.
+    const carryOverLimitedProjects = () => {
       const limitedIds = new Set(rateLimitedCredentials.map((r) => r.id));
+      if (limitedIds.size === 0) return;
       for (let i = allProjects.length - 1; i >= 0; i--) {
         if (limitedIds.has(allProjects[i].credentialId || "")) {
           allProjects.splice(i, 1);
@@ -719,6 +729,30 @@ async function buildDashboard(
       for (let i = allOfflineDevices.length - 1; i >= 0; i--) {
         if (limitedIds.has(allOfflineDevices[i].credentialId || "")) {
           allOfflineDevices.splice(i, 1);
+        }
+      }
+      const prev = opts?.prev;
+      if (!prev) return;
+      const freshKeys = new Set(
+        allProjects.map((p) => `${p.credentialId}:${p.groupId}`)
+      );
+      for (const p of prev.projects || []) {
+        if (
+          limitedIds.has(p.credentialId || "") &&
+          !freshKeys.has(`${p.credentialId}:${p.groupId}`)
+        ) {
+          allProjects.push(p);
+        }
+      }
+      const freshDevKeys = new Set(
+        allOfflineDevices.map((d) => `${d.credentialId}:${d.serialNumber}`)
+      );
+      for (const d of prev.offlineDevices || []) {
+        if (
+          limitedIds.has(d.credentialId || "") &&
+          !freshDevKeys.has(`${d.credentialId}:${d.serialNumber}`)
+        ) {
+          allOfflineDevices.push(d);
         }
       }
     };
@@ -772,7 +806,7 @@ async function buildDashboard(
           const st = getRateLimitStatus(credentials);
           markLimited(cred, st.retryInSeconds || 30);
           quotaHit = true;
-          dropLimitedProjects();
+          carryOverLimitedProjects();
           continue;
         }
         console.error("Fleet fetch failed, omitting device details:", e);
@@ -1015,7 +1049,7 @@ async function buildDashboard(
           const st = getRateLimitStatus(credentials);
           markLimited(cred, st.retryInSeconds || 30);
           quotaHit = true;
-          dropLimitedProjects();
+          carryOverLimitedProjects();
           continue;
         }
         console.error("Failed to fetch received projects:", e);
@@ -1110,7 +1144,7 @@ async function buildDashboard(
           const st = getRateLimitStatus(credentials);
           markLimited(cred, st.retryInSeconds || 30);
           quotaHit = true;
-          dropLimitedProjects();
+          carryOverLimitedProjects();
           continue;
         }
         console.error("Failed to fetch owned projects:", e);
@@ -1130,8 +1164,9 @@ async function buildDashboard(
       if (status.limited) markLimited(cred, status.retryInSeconds);
     }
 
-    // Final pass — hide any leftover rows for credentials that hit their limit.
-    dropLimitedProjects();
+    // Final pass — swap any leftover rows for limited credentials with their
+    // last-known payload rows so their sites stay on screen.
+    carryOverLimitedProjects();
 
     // Reject bogus site coordinates (0,0, swapped lat/lng, foreign hits)
     // before they are plotted: clear them so the group-geo and name-geocode

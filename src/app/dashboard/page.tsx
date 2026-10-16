@@ -894,13 +894,17 @@ export default function Dashboard() {
         {limitedCreds.length > 0 && (
           <div className="shrink-0 bg-orange-50 border border-orange-200 rounded-lg p-4">
             <p className="text-orange-800 font-medium">
-              Credential limit reached — projects hidden
+              API quota limit reached — showing last known data
             </p>
             <ul className="mt-2 space-y-1">
               {limitedCreds.map((c) => (
                 <li key={c.id} className="text-sm text-orange-700">
-                  <span className="font-semibold">{c.name}</span> reached its
-                  API limit
+                  <span className="font-semibold">{c.name}</span> hit its
+                  Ruijie API quota
+                  {c.retryInSeconds > 0
+                    ? ` — retrying in ${c.retryInSeconds}s`
+                    : ""}
+                  . Sites below for this API are the last known status.
                 </li>
               ))}
             </ul>
