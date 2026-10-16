@@ -86,10 +86,10 @@ const DEFAULT_INTERVAL_SECONDS = 100 * 60;
 const FAST_POLL_SECONDS = 60;
 /** Manual Sync Data / spam guard: at most one force sync per minute. */
 const MANUAL_REFRESH_COOLDOWN_MS = 60_000;
-/** Sync-finished alarm: keep beeping for 8 minutes after the cycle ends. */
-const BEEP_DURATION_MS = 8 * 60_000;
+/** Sync-finished alarm: keep beeping for 8 seconds after the cycle ends. */
+const BEEP_DURATION_MS = 8_000;
 /** Pause between beeps inside the alarm window. */
-const BEEP_REPEAT_MS = 10_000;
+const BEEP_REPEAT_MS = 2_000;
 
 let audioCtx: AudioContext | null = null;
 

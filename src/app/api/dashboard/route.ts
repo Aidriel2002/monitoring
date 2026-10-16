@@ -225,6 +225,20 @@ export async function GET(request: Request) {
     // to the previous payload if the shared quota runs out mid-build.
     const cached = cacheGet<DashboardPayload>(cacheKey);
 
+    // An API was enabled/disabled since the cached payload was built (the
+    // in-memory cache is per-instance on serverless, so a toggle on another
+    // instance never cleared this one). Rebuild immediately against the
+    // current credential set instead of serving stale sites for the rest of
+    // the 100-minute cycle — unless we're inside a rate-limit hold.
+    if (cached && !coolingCred) {
+      const cachedIds = cached.credentialIds;
+      const credsChanged =
+        !cachedIds ||
+        cachedIds.length !== creds.length ||
+        creds.some((c) => !cachedIds.includes(c.id));
+      if (credsChanged) cacheClear(cacheKey);
+    }
+
     // Refresh button: reset the 100m status window and rebuild immediately.
     // Not while cooling down — there is nothing to refresh, the calls would
     // only earn more code 44s (Sync Data falls back to the last payload).
@@ -367,6 +381,8 @@ interface DashboardPayload {
   offlineSites: ProjectWithDevices[];
   rateLimitedCredentials: RateLimitedCredential[];
   degraded: boolean;
+  /** Credential set the payload was built from — used to detect enable/disable changes. */
+  credentialIds?: string[];
 }
 
 /**
@@ -398,14 +414,17 @@ function applyLiveRateLimits(
       : (payload.rateLimitedCredentials || []);
 
   const limitedIds = new Set(limitedCreds.map((r) => r.id));
-  const projects = (payload.projects || []).filter(
-    (p) => !limitedIds.has(p.credentialId || "")
+  // `creds` is the currently-enabled set — sites from a credential that has
+  // since been disabled must not be served even from a stale cached payload.
+  const activeIds = new Set(creds.map((c) => c.id));
+  const visible = (credentialId?: string) =>
+    activeIds.has(credentialId || "") && !limitedIds.has(credentialId || "");
+  const projects = (payload.projects || []).filter((p) => visible(p.credentialId));
+  const offlineDevices = (payload.offlineDevices || []).filter((d) =>
+    visible(d.credentialId)
   );
-  const offlineDevices = (payload.offlineDevices || []).filter(
-    (d) => !limitedIds.has(d.credentialId || "")
-  );
-  const offlineSites = (payload.offlineSites || []).filter(
-    (p) => !limitedIds.has(p.credentialId || "")
+  const offlineSites = (payload.offlineSites || []).filter((p) =>
+    visible(p.credentialId)
   );
 
   return {
@@ -1011,5 +1030,6 @@ async function buildDashboard(
       offlineSites,
       rateLimitedCredentials,
       degraded,
+      credentialIds: creds.map((c) => c.id),
     };
 }
