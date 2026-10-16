@@ -241,6 +241,9 @@ async function runRebuild(
     // credential that is currently rate-limited are filtered on read anyway.
     if (Array.isArray(fresh.projects) && fresh.projects.length > 0) {
       await durableSave(userId, fresh);
+      // Fresh geocoded provinces/sites — drop the contacts picker cache so
+      // the Add Contact form picks them up without waiting out its TTL.
+      cacheClear(`contacts:v1:${userId}`);
     }
     console.log(
       `[dashboard] rebuild ${Date.now() - started}ms sites=${fresh.projects.length}` +

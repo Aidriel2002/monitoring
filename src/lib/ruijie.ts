@@ -126,6 +126,14 @@ function delay(ms: number) {
 let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL = 500; // 500ms between calls (limit is 20/sec)
 /**
+ * Hard per-request timeout. A hung Ruijie call (connection accepted, no
+ * response) used to leave the fetch promise unsettled forever — the
+ * dashboard's `activeRebuilds` and the cache `inflight` map then held that
+ * dead promise, so every later poll re-joined it and served stale data
+ * indefinitely, even after the rate-limit cooldown lifted.
+ */
+const REQUEST_TIMEOUT_MS = 20_000;
+/**
  * Per-credential cooldown after code 44.
  * Keyed by baseUrl:appId so one limited app doesn't freeze the other account.
  */
@@ -190,7 +198,12 @@ async function throttledFetch(
   const wait = MIN_REQUEST_INTERVAL - (now - lastRequestTime);
   if (wait > 0) await delay(wait);
   lastRequestTime = Date.now();
-  return fetch(url, init);
+  // A timeout must be applied here (not left to the caller) so no call path
+  // can hang indefinitely and pin the rebuild/inflight maps on a dead promise.
+  return fetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
 }
 
 async function fetchRuijie<T>(

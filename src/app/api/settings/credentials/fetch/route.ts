@@ -8,7 +8,6 @@ import {
 } from "@/lib/ruijie";
 import { mapSharedProjects, ProjectsCache } from "@/lib/projects-cache";
 import { cacheClear } from "@/lib/cache";
-import { durableClear } from "@/lib/dashboard-cache";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 
 async function getUser(request: Request) {
@@ -113,10 +112,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // New inventory — drop both cache layers so the next dashboard load
-    // rebuilds from it (memory alone is per-instance on serverless).
+    // New inventory — drop the per-instance cache so the next dashboard load
+    // rebuilds from it. The durable Supabase copy is deliberately KEPT: it is
+    // the last-resort answer when that rebuild fails (e.g. the Ruijie daily
+    // quota is exhausted right after this sync burned calls on it). Deleting
+    // it here is what left the dashboard with nothing after a failed rebuild —
+    // the rebuild overwrites it on success anyway (durableSave in runRebuild).
     cacheClear(`dashboard:${user.id}`);
-    await durableClear(user.id);
+    cacheClear(`contacts:v1:${user.id}`);
     void broadcastDashboardUpdate(user.id, {});
 
     return NextResponse.json({

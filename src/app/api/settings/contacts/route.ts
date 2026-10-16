@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheClear, cacheGet, cacheSet } from "@/lib/cache";
+import { durableLoad } from "@/lib/dashboard-cache";
 import { parseProjectsCache } from "@/lib/projects-cache";
 import type { ProjectTreeNode } from "@/lib/ruijie";
 import { normalizePhone } from "@/lib/notify";
@@ -162,12 +163,26 @@ export async function GET(request: Request) {
     // Every known project: dashboard payload first (carries geocoded
     // province + owning credential), then the persisted inventory from
     // Sync devices (per credential name — "Phase 3", "Bukidnon", ...).
+    //
+    // The in-memory dashboard cache is per-instance on serverless and is
+    // usually empty on a cold start — fall back to the durable Supabase
+    // copy (same payload the dashboard itself falls back to) so geocoded
+    // provinces and dashboard-known sites are not silently lost.
     const projectMap = new Map<
       number,
       { name: string; province?: string; credentialName?: string }
     >();
+    let dashboardProjects: DashboardCacheShape["projects"] = [];
     const cached = cacheGet<DashboardCacheShape>(`dashboard:${user.id}`);
-    for (const p of cached?.projects || []) {
+    if (cached?.projects?.length) {
+      dashboardProjects = cached.projects;
+    } else {
+      const durable = await durableLoad<DashboardCacheShape>(user.id);
+      if (durable?.payload?.projects?.length) {
+        dashboardProjects = durable.payload.projects;
+      }
+    }
+    for (const p of dashboardProjects || []) {
       if (!p.name) continue;
       projectMap.set(p.groupId, {
         name: p.name,
@@ -254,35 +269,53 @@ export async function GET(request: Request) {
       });
     }
 
-    // Provinces: only ones that have at least one project behind them.
-    // Prefer the geocoded province; fall back to the name prefix.
-    const provinceSet = new Set<string>();
-    for (const entry of projectMap.values()) {
-      const province =
-        REGION10_PROVINCES.find(
-          (known) => known.toLowerCase() === (entry.province || "").toLowerCase()
-        ) ||
-        REGION10_PROVINCES.find((known) =>
-          entry.name
-            .replace(/_/g, " ")
-            .replace(/\s+/g, " ")
-            .trim()
-            .toLowerCase()
-            .startsWith(known.toLowerCase())
-        ) ||
-        inferProvinceFromName(entry.name);
-      if (province) provinceSet.add(province);
+    // Provinces: every geocoded province behind a project, plus Region 10
+    // provinces inferred from project-name prefixes. ANY non-empty geocoded
+    // province is accepted (not just Region 10) so the picker is not
+    // silently truncated when a site geocodes outside the known list.
+    // Deduped case-insensitively; Region 10 canonical spelling wins.
+    const provinceByLower = new Map<string, string>();
+    function addProvince(raw: string | null | undefined) {
+      const name = (raw || "").replace(/\s+/g, " ").trim();
+      if (!name) return;
+      const lower = name.toLowerCase();
+      const canonical =
+        REGION10_PROVINCES.find((known) => known.toLowerCase() === lower) ||
+        name;
+      const existing = provinceByLower.get(lower);
+      if (
+        !existing ||
+        (existing !== canonical &&
+          REGION10_PROVINCES.some((k) => k.toLowerCase() === lower))
+      ) {
+        provinceByLower.set(lower, canonical);
+      }
     }
+    for (const entry of projectMap.values()) {
+      addProvince(entry.province);
+      // Fallback: infer from the project-name prefix when geocode is missing.
+      // Store it back on the entry so province → site auto-select covers it.
+      if (!entry.province) {
+        const inferred = inferProvinceFromName(entry.name);
+        if (inferred) entry.province = inferred;
+        addProvince(inferred);
+      }
+    }
+    const provinces = [...provinceByLower.values()].sort((a, b) =>
+      a.localeCompare(b)
+    );
 
     const payload: ContactsResponsePayload = {
       contacts: (contacts || []).map(toContactDto),
-      provinces: [...provinceSet].sort((a, b) => a.localeCompare(b)),
+      provinces,
       projects: [...projectMap.entries()]
         .map(([groupId, e]) => ({
           groupId,
           name: e.name,
           credentialName: e.credentialName || "",
-          province: e.province || "",
+          // Normalize to the dropdown's canonical casing so the client's
+          // province → site auto-selection map keys match exactly.
+          province: provinceByLower.get((e.province || "").toLowerCase()) || "",
         }))
         .sort(
           (a, b) =>

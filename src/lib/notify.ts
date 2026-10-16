@@ -287,7 +287,7 @@ function formatDowntime(lastOnline: number): string {
  * Build the monitoring report text — grouped project → province → site, with
  * a blank line between every element:
  *
- *   Hello sir (name), the following site(s) need your attention.
+ *   Hello name, the following site(s) need your attention.
  *
  *   PROJECT NAME
  *
@@ -300,9 +300,9 @@ export function buildMonitoringReport(
   sites: NotifySite[],
   contactName?: string
 ): string {
-  const greeting = `Hello sir ${
-    contactName ? `(${contactName}) ` : ""
-  }the following site(s) need your attention.`;
+  const greeting = contactName
+    ? `Hello ${contactName}, the following site(s) need your attention.`
+    : `Hello, the following site(s) need your attention.`;
 
   // Group sites: project → province → sites
   const byProject = new Map<string, Map<string, NotifySite[]>>();
