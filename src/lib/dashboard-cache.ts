@@ -44,7 +44,12 @@ export async function durableLoad<T>(
   }
 }
 
-/** Persist a freshly built healthy payload. Best-effort. */
+/**
+ * Persist the last built payload. Best-effort, but a failure here is
+ * expensive: without this row every cold start redoes the full rebuild and
+ * a slow one turns into a gateway timeout (502) with an empty dashboard —
+ * so the Supabase error is surfaced instead of being swallowed.
+ */
 export async function durableSave(
   userId: string,
   payload: unknown
@@ -53,7 +58,7 @@ export async function durableSave(
     const sb = getSupabaseServiceRole();
     // Partial upsert: only the provided columns are written, so an existing
     // notified_hash (Telegram claim) survives a payload refresh.
-    await sb
+    const { error } = await sb
       .from(TABLE)
       .upsert(
         {
@@ -63,8 +68,14 @@ export async function durableSave(
         },
         { onConflict: "user_id" }
       );
-  } catch {
-    // best-effort — the in-memory cache still covers this instance
+    if (error) {
+      console.error(`durableSave(${userId}) failed:`, error.message);
+    }
+  } catch (e) {
+    console.error(
+      "durableSave threw:",
+      e instanceof Error ? e.message : e
+    );
   }
 }
 
@@ -93,8 +104,14 @@ export async function notifiedHashGet(userId: string): Promise<string | null> {
 }
 
 /**
- * Record that the report for `hash` was delivered. Creates a stub row (empty
- * payload) when the user has none yet — durableLoad ignores those stubs.
+ * Record that the report for `hash` was delivered. Creates a stub row (default
+ * empty payload) when the user has none yet — durableLoad ignores those stubs.
+ *
+ * IMPORTANT: never include `payload` here. A supabase-js upsert SETs every
+ * provided column, so sending `payload: {}` overwrote the last healthy
+ * dashboard payload on every Telegram report — cold starts then had to redo
+ * the full rebuild and timed out (502 / "Error fetching dashboard", 0 sites).
+ * Omitting the column leaves the existing payload untouched on conflict.
  */
 export async function notifiedHashSet(
   userId: string,
@@ -104,10 +121,7 @@ export async function notifiedHashSet(
     const sb = getSupabaseServiceRole();
     await sb
       .from(TABLE)
-      .upsert(
-        { user_id: userId, notified_hash: hash, payload: {} },
-        { onConflict: "user_id" }
-      );
+      .upsert({ user_id: userId, notified_hash: hash }, { onConflict: "user_id" });
   } catch {
     // best-effort — worst case a duplicate report is sent
   }

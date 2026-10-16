@@ -17,9 +17,10 @@ const notifyingUsers = new Set<string>();
 /**
  * An unchanged down-set is re-reported at most this often. Sync cycles are
  * 10 minutes — without this floor a site down for a day would generate 144
- * identical Telegram reports per contact.
+ * identical Telegram reports per contact. 3 hours per the agreed cadence:
+ * report on change, then repeat the same report every 3 hours.
  */
-const MIN_REPORT_REPEAT_MS = 60 * 60_000;
+const MIN_REPORT_REPEAT_MS = 3 * 60 * 60_000;
 
 interface InboxUpdate {
   update_id: number;
@@ -42,6 +43,10 @@ export interface NotifySite {
   groupId: number;
   name: string;
   province?: string;
+  /** Dashboard "By project" label — the owning credential's name. */
+  projectName?: string;
+  credentialId?: string;
+  credentialName?: string;
   offlineCount: number;
   totalCount: number;
   devices: NotifyDevice[];
@@ -262,20 +267,49 @@ export async function sendTelegramMessage(
 }
 
 /**
- * Build the monitoring report text — one block per down site, separated by
- * a blank line:
+ * Build the monitoring report text — grouped project → province → site, with
+ * a blank line between every element:
  *
- *   Good day, Down Site in Site A (Cavite).
+ *   Hello sir (name), the following site(s) need your attention.
  *
- *   Good day, Down Site in Site B (Rizal).
+ *   PROJECT NAME
+ *
+ *   Province
+ *
+ *   * Site A
+ *   * Site B
  */
-export function buildMonitoringReport(sites: NotifySite[]): string {
-  const blocks: string[] = [];
+export function buildMonitoringReport(
+  sites: NotifySite[],
+  contactName?: string
+): string {
+  const greeting = `Hello sir ${
+    contactName ? `(${contactName}) ` : ""
+  }the following site(s) need your attention.`;
 
+  // Group sites: project → province → sites
+  const byProject = new Map<string, Map<string, NotifySite[]>>();
   for (const site of sites.slice(0, MAX_SITES)) {
-    const where = site.province ? ` (${site.province})` : "";
-    blocks.push(`Good day, Down Site in ${site.name}${where}.`);
+    const project = site.projectName || site.credentialName || "Unknown";
+    const province = site.province || "Unknown";
+    if (!byProject.has(project)) byProject.set(project, new Map());
+    const byProvince = byProject.get(project)!;
+    if (!byProvince.has(province)) byProvince.set(province, []);
+    byProvince.get(province)!.push(site);
   }
+
+  const blocks: string[] = [greeting];
+
+  for (const [project, byProvince] of byProject) {
+    blocks.push(project);
+    for (const [province, provSites] of byProvince) {
+      blocks.push(province);
+      for (const site of provSites) {
+        blocks.push(`* ${site.name}`);
+      }
+    }
+  }
+
   if (sites.length > MAX_SITES) {
     blocks.push(`...and ${sites.length - MAX_SITES} more down sites.`);
   }
@@ -330,7 +364,12 @@ export async function sendOfflineReports(
 ): Promise<void> {
   if (!process.env.TELEGRAM_BOT_TOKEN) return;
 
-  const sites = (payload.offlineSites || []).filter((s) => s.offlineCount > 0);
+  const sites = (payload.offlineSites || [])
+    .filter((s) => s.offlineCount > 0)
+    .map((s) => ({
+      ...s,
+      projectName: s.projectName || s.credentialName,
+    }));
   if (sites.length === 0) return;
   if (notifyingUsers.has(userId)) return;
   notifyingUsers.add(userId);
@@ -414,7 +453,7 @@ export async function sendOfflineReports(
       }
 
       sends.push(
-        sendTelegramMessage(chatId, buildMonitoringReport(scoped))
+        sendTelegramMessage(chatId, buildMonitoringReport(scoped, contact.name))
           .then(() => {
             console.log(
               `Telegram report sent to ${contact.name} (${chatId}) — ` +

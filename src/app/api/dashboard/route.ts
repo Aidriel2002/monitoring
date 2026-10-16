@@ -1,12 +1,8 @@
 import { NextResponse, after } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
-import { cacheFetch, cacheClear, cacheGet, cacheSet } from "@/lib/cache";
+import { cacheClear, cacheGet, cacheSet } from "@/lib/cache";
 import { diskGet, diskSet } from "@/lib/disk-cache";
-import {
-  durableLoad,
-  durableSave,
-  durableClear,
-} from "@/lib/dashboard-cache";
+import { durableLoad, durableSave } from "@/lib/dashboard-cache";
 import {
   getProjects,
   fetchProjectTree,
@@ -29,15 +25,6 @@ import { reverseGeocodeProvince, geocodeSiteName, isValidSiteGeo } from "@/lib/g
 import { parseProjectsCache } from "@/lib/projects-cache";
 import { broadcastDashboardUpdate } from "@/lib/realtime";
 import { processTelegramInbox, sendOfflineReports } from "@/lib/notify";
-
-/** Healthy payload matches the 10m status cycle; limited/degraded re-seat to 15s. */
-const DASHBOARD_TTL_MS = DEVICE_STATUS_INTERVAL_SECONDS * 1000;
-/**
- * How long a known-good payload may back a degraded rebuild (fleet/tree
- * failure) instead of blanking the dashboard. Bounded so genuinely-gone
- * data still disappears within a workday.
- */
-const STALE_DASHBOARD_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Warn-log rows are reused between cycles while a group's offline count is
@@ -196,15 +183,110 @@ function warnLogsToDevices(
     }));
 }
 
+/** Healthy payload matches the 10m status cycle; limited/degraded re-seat to 15s. */
+const DASHBOARD_TTL_MS = DEVICE_STATUS_INTERVAL_SECONDS * 1000;
+/** Degraded / rate-limited payloads get a short in-memory TTL so they self-heal. */
+const DEGRADED_TTL_MS = 15_000;
+/**
+ * How long a known-good payload may back a degraded rebuild (fleet/tree
+ * failure) instead of blanking the dashboard. Bounded so genuinely-gone
+ * data still disappears within a workday.
+ */
+const STALE_DASHBOARD_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/**
+ * How long to wait for a first-ever build before answering anyway. A cold
+ * rebuild is tens of seconds of sequential Ruijie calls — waiting for all of
+ * it is what pushed the function past Netlify's execution limit (502 →
+ * "Error fetching dashboard" → zero sites). Past this point the response
+ * reports `rebuilding` and the build finishes in the background.
+ */
+const FIRST_BUILD_WAIT_MS = 20_000;
+/** Poll again this soon when the response was served stale / is rebuilding. */
+const REVALIDATE_POLL_SECONDS = 30;
+
+/**
+ * One rebuild per user across concurrent polls — without this every tab and
+ * every retry stacks its own full Ruijie rebuild (quota + duration multiply).
+ */
+const activeRebuilds = new Map<string, Promise<DashboardPayload>>();
+
+/**
+ * Build the payload, park it in the in-memory cache (short TTL when
+ * degraded), persist the durable copy when it still has sites, and log the
+ * duration — a missing durable row was the reason every cold start had to
+ * redo the whole rebuild. Rejections are surfaced to the caller; a caller
+ * that stops awaiting (timeout) must not turn that into an unhandled
+ * rejection, and the rebuild must still finish for everyone else.
+ */
+async function runRebuild(
+  userId: string,
+  cacheKey: string,
+  creds: CredentialRow[],
+  opts: { forceGeo?: boolean; prev?: DashboardPayload }
+): Promise<DashboardPayload> {
+  const existing = activeRebuilds.get(cacheKey);
+  if (existing) return existing;
+
+  const tracked = (async () => {
+    const started = Date.now();
+    const fresh = await buildDashboard(creds, {
+      forceGeo: opts.forceGeo,
+      prev: opts.prev,
+    });
+    const healthy =
+      !fresh.degraded && (fresh.rateLimitedCredentials || []).length === 0;
+    cacheSet(cacheKey, fresh, healthy ? DASHBOARD_TTL_MS : DEGRADED_TTL_MS);
+    // Any payload with sites is worth keeping: the durable copy is what lets
+    // a cold instance answer instantly instead of timing out. Sites of a
+    // credential that is currently rate-limited are filtered on read anyway.
+    if (Array.isArray(fresh.projects) && fresh.projects.length > 0) {
+      await durableSave(userId, fresh);
+    }
+    console.log(
+      `[dashboard] rebuild ${Date.now() - started}ms sites=${fresh.projects.length}` +
+        ` healthy=${healthy} degraded=${fresh.degraded}`
+    );
+    return fresh;
+  })().finally(() => activeRebuilds.delete(cacheKey));
+
+  activeRebuilds.set(cacheKey, tracked);
+  tracked.catch(() => undefined);
+  return tracked;
+}
+
+/** `value`, or null when `promise` did not settle within `ms`. */
+async function orTimeout<T>(
+  promise: Promise<T>,
+  ms: number
+): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function GET(request: Request) {
+  // Kept outside the try so a failure below can still answer with the last
+  // durable payload instead of a bare 500.
+  let userId: string | null = null;
+  let creds: CredentialRow[] | null = null;
   try {
     const user = await getUser(request);
     if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    userId = user.id;
 
     const supabase = getSupabaseServiceRole();
-    const { data: creds, error: credsError } = await supabase
+    const { data: credsData, error: credsError } = await supabase
       .from("api_credentials")
       .select("*")
       .eq("user_id", user.id)
@@ -214,13 +296,17 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: credsError.message }, { status: 500 });
     }
 
-    if (!creds || creds.length === 0) {
+    const credRows = (credsData || []) as unknown as CredentialRow[];
+    creds = credRows;
+
+    if (credRows.length === 0) {
       return NextResponse.json({
         projects: [],
         offlineDevices: [],
         offlineSites: [],
         rateLimitedCredentials: [],
         statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+        nextUpdateInSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
       });
     }
 
@@ -231,33 +317,33 @@ export async function GET(request: Request) {
     // up flagged at once. While a cooldown is active, hold the rebuild: the
     // last payload keeps every other credential's projects on screen and only
     // the credential that actually hit the limit is reported.
-    const coolingCred = creds.some((cred) =>
+    const coolingCred = credRows.some((cred) =>
       getRateLimitStatus(toRuijieCreds(cred)).limited
     );
-    // Read before any cacheClear below so a forced rebuild can still fall back
-    // to the previous payload if the shared quota runs out mid-build.
-    const cached = cacheGet<DashboardPayload>(cacheKey);
-
-    // An API was enabled/disabled since the cached payload was built (the
-    // in-memory cache is per-instance on serverless, so a toggle on another
-    // instance never cleared this one). Rebuild immediately against the
-    // current credential set instead of serving stale sites for the rest of
-    // the current cycle — unless we're inside a rate-limit hold.
-    if (cached && !coolingCred) {
-      if (!credentialSetMatches(cached.credentialIds, creds)) {
-        cacheClear(cacheKey);
-        await durableClear(user.id);
-      }
-    }
-
     // Refresh button: reset the status window and rebuild immediately.
     // Not while cooling down — there is nothing to refresh, the calls would
     // only earn more code 44s (Sync Data falls back to the last payload).
     const forceStatus =
       new URL(request.url).searchParams.get("refresh") === "status" &&
       !coolingCred;
+
+    // An API was enabled/disabled since the cached payload was built (the
+    // in-memory cache is per-instance on serverless, so a toggle on another
+    // instance never cleared this one). Drop the IN-MEMORY copy so a rebuild
+    // is scheduled — the durable row is deliberately kept: it is the
+    // last-resort answer if that rebuild fails, and applyLiveRateLimits
+    // already hides credentials that are no longer active. Deleting it first
+    // is what left the dashboard with nothing after a 500/502.
+    const cached = cacheGet<DashboardPayload>(cacheKey);
+    if (
+      cached &&
+      !coolingCred &&
+      !credentialSetMatches(cached.credentialIds, credRows)
+    ) {
+      cacheClear(cacheKey);
+    }
     if (forceStatus) {
-      for (const cred of creds) {
+      for (const cred of credRows) {
         invalidateDeviceStatus({
           appId: cred.app_id,
           secret: cred.secret,
@@ -266,66 +352,156 @@ export async function GET(request: Request) {
         });
       }
       cacheClear(cacheKey);
-      await durableClear(user.id);
+    }
+    const mem = cacheGet<DashboardPayload>(cacheKey);
+
+    // Durable Supabase copy — cold starts answer from it instead of redoing
+    // the full rebuild (which on Netlify is tens of seconds of sequential
+    // Ruijie calls). Accepted well past the status TTL: a stale payload with
+    // sites beats a blank one while a background rebuild runs.
+    const durable = await durableLoad<DashboardPayload>(user.id);
+    const durableAgeMs = durable ? Date.now() - durable.builtAtMs : Infinity;
+    const durableUsable =
+      !!durable &&
+      durableAgeMs <= STALE_DASHBOARD_MAX_AGE_MS &&
+      credentialSetMatches(durable.payload.credentialIds, credRows);
+    const lastResort =
+      durable && durableAgeMs <= STALE_DASHBOARD_MAX_AGE_MS
+        ? durable.payload
+        : undefined;
+
+    const ageOf = (p: DashboardPayload) =>
+      typeof p.builtAt === "number" ? Date.now() - p.builtAt : Infinity;
+
+    let payload: DashboardPayload | undefined = mem;
+    if (!payload && durableUsable && durable) payload = durable.payload;
+
+    // Rate-limit hold: serve the last payload, make no Ruijie calls.
+    const cooling = coolingCred && !!payload;
+    const needsRebuild =
+      !cooling &&
+      (!payload ||
+        forceStatus ||
+        ageOf(payload) >= DASHBOARD_TTL_MS ||
+        payload.degraded === true);
+
+    let pendingRebuild: Promise<DashboardPayload> | null = null;
+    let syncBuilt = false;
+    let rebuilding = false;
+    let rebuildError: string | null = null;
+
+    if (needsRebuild) {
+      pendingRebuild = runRebuild(user.id, cacheKey, credRows, {
+        forceGeo: forceStatus,
+        prev: payload || lastResort,
+      });
+
+      if (!payload) {
+        // Nothing to show yet — wait briefly so a normal build still answers
+        // inline. Anything longer risks the host's execution limit, so the
+        // response reports `rebuilding` and after() finishes the work.
+        try {
+          const built = await orTimeout(pendingRebuild, FIRST_BUILD_WAIT_MS);
+          if (built) {
+            payload = built;
+            syncBuilt = true;
+          } else {
+            rebuilding = true;
+          }
+        } catch (e) {
+          rebuildError = e instanceof Error ? e.message : String(e);
+          rebuilding = true;
+        }
+      } else {
+        // Stale-but-usable: answer now, refresh after the response. The short
+        // memory TTL keeps repeat polls cheap while the rebuild runs.
+        rebuilding = true;
+        cacheSet(cacheKey, payload, REVALIDATE_POLL_SECONDS * 1000);
+      }
     }
 
-    // One shared payload per user — concurrent tab polls hit memory, not Ruijie.
-    // Degraded / rate-limited results get a short TTL so they self-heal.
-    // The loader ONLY builds the payload. Post-rebuild side effects (realtime
-    // broadcast) run via after() below so the HTTP response is never blocked
-    // on them — critical on serverless hosts (Netlify) where awaiting work
-    // before responding pushes the function past its timeout (502s).
-    let rebuilt = false;
-    let payload: DashboardPayload | undefined;
-    if (coolingCred && cached) {
-      // Rate-limit hold: serve the last payload, make no Ruijie calls.
-      payload = cached;
-    }
-    if (!payload) {
-      // Durable Supabase copy — cold starts on serverless answer instantly
-      // from the last healthy payload instead of redoing the full rebuild
-      // (which on Netlify is tens of seconds of sequential Ruijie calls).
-      const durable = await durableLoad<DashboardPayload>(user.id);
-      if (
-        durable &&
-        Date.now() - durable.builtAtMs < DASHBOARD_TTL_MS &&
-        credentialSetMatches(durable.payload.credentialIds, creds)
-      ) {
-        const remaining = Math.max(
-          DASHBOARD_TTL_MS - (Date.now() - durable.builtAtMs),
-          60_000
-        );
-        cacheSet(cacheKey, durable.payload, remaining);
-        payload = durable.payload;
-      }
-    }
-    if (!payload) {
-      payload = await cacheFetch(cacheKey, DASHBOARD_TTL_MS, async () => {
-        rebuilt = true;
-        return buildDashboard(creds, {
-          forceGeo: forceStatus,
-          prev: cached,
-        });
-      });
-      // A degraded rebuild (fleet/tree failure) must not blank a dashboard
-      // that had sites — fall back to the last known-good durable payload.
-      if (rebuilt && payload.degraded) {
-        const stale = await durableLoad<DashboardPayload>(user.id);
-        if (
-          stale &&
-          Array.isArray(stale.payload.projects) &&
-          stale.payload.projects.length > 0 &&
-          credentialSetMatches(stale.payload.credentialIds, creds) &&
-          Date.now() - stale.builtAtMs <= STALE_DASHBOARD_MAX_AGE_MS
-        ) {
-          payload = stale.payload;
+    const uid = user.id;
+    const backgroundBuild = !!pendingRebuild && !syncBuilt;
+    if (pendingRebuild) {
+      const pending = pendingRebuild;
+      after(async () => {
+        let fresh: DashboardPayload | null = null;
+        try {
+          fresh = await pending;
+        } catch (e) {
+          console.warn(
+            "Dashboard rebuild failed:",
+            e instanceof Error ? e.message : e
+          );
         }
-      }
+        if (fresh) {
+          if (backgroundBuild) {
+            // Push fresh data (and limit flags) to open dashboards — realtime
+            // costs no Ruijie quota and avoids waiting for the next poll.
+            await broadcastDashboardUpdate(uid, {
+              rateLimitedCredentials: fresh.rateLimitedCredentials,
+              degraded: fresh.degraded,
+            }).catch(() => undefined);
+          }
+          // Telegram outage report — post-response: sending before the HTTP
+          // response is what caused Netlify 502s on top of a long rebuild.
+          await sendOfflineReports(uid, fresh).catch((e) =>
+            console.warn(
+              "Offline notifications failed:",
+              e instanceof Error ? e.message : e
+            )
+          );
+        }
+        // Bot inbox housekeeping: link phone numbers and reply to new chats so
+        // the bot responds within ~a minute of being messaged. Throttled inside
+        // (one scan per minute per instance).
+        await processTelegramInbox().catch(() => undefined);
+      });
+    } else if (payload) {
+      // Fresh hit — send inline (bounded): if a host froze after() before the
+      // report went out, the next poll delivers it.
+      await Promise.race([
+        sendOfflineReports(uid, payload).catch(() => undefined),
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, 12_000);
+          (t as NodeJS.Timeout).unref?.();
+        }),
+      ]);
+      after(() => processTelegramInbox().catch(() => undefined));
+    }
+
+    // A degraded rebuild that produced no sites must not blank a dashboard an
+    // older copy still has data for (rate limits / fleet failures do this).
+    if (
+      payload &&
+      payload.projects.length === 0 &&
+      payload.degraded &&
+      lastResort &&
+      lastResort.projects.length > 0
+    ) {
+      payload = lastResort;
+    }
+
+    // Nothing usable at all (first run and the build failed) — answer with an
+    // explicit error instead of an empty-but-"successful" dashboard, so the
+    // client shows the failure banner and retries with backoff.
+    if (!payload) {
+      return NextResponse.json({
+        projects: [],
+        offlineDevices: [],
+        offlineSites: [],
+        rateLimitedCredentials: [],
+        degraded: true,
+        rebuilding: true,
+        error: rebuildError || "Dashboard rebuild did not finish",
+        statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+        nextUpdateInSeconds: REVALIDATE_POLL_SECONDS,
+      });
     }
 
     // Overlay live cooldown state on every response — even when the dashboard
     // cache still holds a "healthy" payload from before code 44.
-    const response = applyLiveRateLimits(payload, creds);
+    const response = applyLiveRateLimits(payload, credRows);
 
     // Payloads cached before coordinate validation may still carry bogus
     // coords — strip them on the way out so the map never plots them.
@@ -352,66 +528,15 @@ export async function GET(request: Request) {
 
     const ttl =
       response.degraded || response.rateLimitedCredentials.length > 0
-        ? 15_000
+        ? DEGRADED_TTL_MS
         : DASHBOARD_TTL_MS;
-    // Re-seat TTL for degraded/limited payloads (cacheFetch already stored full TTL)
-    // — also while holding the rebuild, so the next request after the cooldown
-    // expires rebuilds instead of serving stale data for another status cycle.
-    if (ttl < DASHBOARD_TTL_MS) {
+    // Re-seat TTL for degraded/limited payloads so the next request after the
+    // cooldown expires rebuilds instead of serving stale data for another
+    // status cycle. Skipped while a rebuild is already running — that entry
+    // is the raw payload the rebuild will replace.
+    if (ttl < DASHBOARD_TTL_MS && !rebuilding) {
       cacheSet(cacheKey, response, ttl);
     }
-    // Persist fresh healthy builds durably (before responding — after() can be
-    // cut off on serverless and the next cold start depends on this row).
-    if (rebuilt && ttl === DASHBOARD_TTL_MS) {
-      await durableSave(user.id, payload);
-    }
-
-    // Telegram outage report. The claim (durable notified_hash, checked inside
-    // sendOfflineReports) guarantees one report per sync cycle:
-    //   - rebuilt cycles send from after() — Telegram before the response is
-    //     what caused Netlify 502s on top of a long rebuild;
-    //   - cache-hit polls send inline (bounded): if a host froze after()
-    //     before the report went out, the next poll delivers it.
-    if (!rebuilt) {
-      await Promise.race([
-        sendOfflineReports(user.id, payload).catch(() => undefined),
-        new Promise((resolve) => {
-          const t = setTimeout(resolve, 12_000);
-          (t as NodeJS.Timeout).unref?.();
-        }),
-      ]);
-    }
-
-    // Post-response side effects — scheduled via after() so the HTTP response
-    // is returned immediately and the work is kept alive to completion. Awaiting
-    // any of these before responding is what caused Netlify 502s: realtime
-    // calls can take seconds, and the function gateway kills the request when
-    // it exceeds its timeout. after() runs them after the response is flushed
-    // but does not freeze them (unlike fire-and-forget void).
-    after(async () => {
-      if (rebuilt) {
-        // Push fresh data (and limit flags) to open dashboards — realtime costs
-        // no Ruijie quota.
-        await broadcastDashboardUpdate(user.id, {
-          rateLimitedCredentials: payload.rateLimitedCredentials,
-          degraded: payload.degraded,
-        }).catch(() => undefined);
-        // Telegram outage report to contact incharges — runs on fresh
-        // rebuilds: the status-TTL expiry and manual Sync Data. If the host
-        // freezes this work, the claim stays unset and the next cache-hit
-        // poll re-sends (see the inline branch above).
-        await sendOfflineReports(user.id, payload).catch((e) =>
-          console.warn(
-            "Offline notifications failed:",
-            e instanceof Error ? e.message : e
-          )
-        );
-      }
-      // Bot inbox housekeeping: link phone numbers and reply to new chats so
-      // the bot responds within ~a minute of being messaged. Throttled inside
-      // (one scan per minute per instance).
-      await processTelegramInbox().catch(() => undefined);
-    });
 
     // Remaining cache window — the client counts THIS down so its zero lands
     // on the server's actual expiry. A full-interval countdown drifts ahead of
@@ -420,17 +545,42 @@ export async function GET(request: Request) {
     // stale-on-error payload cannot pin the client into a per-second loop.
     const builtAtMs =
       typeof payload.builtAt === "number" ? payload.builtAt : Date.now();
-    const nextUpdateInSeconds = Math.max(
-      15,
-      Math.ceil((builtAtMs + ttl - Date.now()) / 1000)
-    );
+    const nextUpdateInSeconds = rebuilding
+      ? REVALIDATE_POLL_SECONDS
+      : Math.max(
+          15,
+          Math.ceil((builtAtMs + ttl - Date.now()) / 1000)
+        );
 
     return NextResponse.json({
       ...response,
       statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
       nextUpdateInSeconds,
+      rebuilding,
+      error: rebuildError || undefined,
     });
   } catch (error) {
+    // Last-resort durable fallback — a 500 with nothing in it is what left the
+    // dashboard empty after a failed rebuild. Answer with the last known
+    // payload (if any) plus the error so the client keeps sites on screen and
+    // shows the retry banner.
+    if (userId && creds) {
+      try {
+        const durable = await durableLoad<DashboardPayload>(userId);
+        if (durable) {
+          const response = applyLiveRateLimits(durable.payload, creds);
+          return NextResponse.json({
+            ...response,
+            statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+            nextUpdateInSeconds: REVALIDATE_POLL_SECONDS,
+            rebuilding: true,
+            error: error instanceof Error ? error.message : "Internal server error",
+          });
+        }
+      } catch {
+        // fall through to plain 500 below
+      }
+    }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Internal server error" },
       { status: 500 }

@@ -91,6 +91,16 @@ const MANUAL_REFRESH_COOLDOWN_MS = 60_000;
 const BEEP_DURATION_MS = 8_000;
 /** Pause between beeps inside the alarm window. */
 const BEEP_REPEAT_MS = 2_000;
+/**
+ * After a failed sync, park the deadline this far out: the visible countdown
+ * shows the retry window and `whenDue` re-fires exactly then — instead of the
+ * failure leaving no deadline at all (no countdown, no data, no retry for a
+ * full status cycle). Escalates 15 → 30 → 60 on consecutive failures so a
+ * hard-down API is not hammered at full speed.
+ */
+const SYNC_RETRY_BACKOFF_SECONDS = [15, 30, 60] as const;
+/** Fetch timeout for /api/dashboard (server may take ~20s on a cold build). */
+const DASHBOARD_FETCH_TIMEOUT_MS = 45_000;
 
 let audioCtx: AudioContext | null = null;
 
@@ -345,7 +355,6 @@ export default function Dashboard() {
   const [offlineSites, setOfflineSites] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   // SSR-safe defaults — restore sessionStorage only after mount (hydration).
-  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [currentTime, setCurrentTime] = useState("");
   const [currentDate, setCurrentDate] = useState("");
   const [rateLimited, setRateLimited] = useState(false);
@@ -353,12 +362,19 @@ export default function Dashboard() {
   const [refreshCountdown, setRefreshCountdown] = useState(
     DEFAULT_INTERVAL_SECONDS
   );
+  const [syncFailed, setSyncFailed] = useState(false);
+  /** Consecutive failed syncs — drives the escalating retry backoff. */
+  const [failCount, setFailCount] = useState(0);
   const [authExpired, setAuthExpired] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [manualCooldown, setManualCooldown] = useState(0);
   const fetchAllRef = useRef<(force?: boolean) => void>(() => {});
   const inFlightRef = useRef(false);
+  // Mirror of syncFailed for the countdown-tick effect (no stale closure).
+  const syncFailedRef = useRef(false);
+  // Mirror of failCount for the retry-backoff calculation (no stale closure).
+  const failCountRef = useRef(0);
   const debounceRef = useRef<number | undefined>(undefined);
   const profileRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<ReturnType<
@@ -411,25 +427,67 @@ export default function Dashboard() {
     }
     inFlightRef.current = true;
 
+    // Park the update window on a short retry: keeps the visible countdown
+    // ticking and makes whenDue re-fire soon instead of leaving no deadline
+    // (which hid the countdown and skipped retries until the next poll).
+    // Escalates on consecutive failures so a hard-down API is not hammered.
+    const parkRetry = (fail = true) => {
+      if (fail) {
+        failCountRef.current += 1;
+        setFailCount(failCountRef.current);
+      }
+      setSyncFailed(fail);
+      const backoff =
+        SYNC_RETRY_BACKOFF_SECONDS[
+          Math.min(failCountRef.current - 1, SYNC_RETRY_BACKOFF_SECONDS.length - 1)
+        ] ?? SYNC_RETRY_BACKOFF_SECONDS[0];
+      const retryAt = Date.now() + backoff * 1000;
+      writeNextRefreshAt(retryAt);
+      setRefreshCountdown(backoff);
+    };
+
     try {
       const dashRes = await authFetch(
-        force ? "/api/dashboard?refresh=status" : "/api/dashboard"
+        force ? "/api/dashboard?refresh=status" : "/api/dashboard",
+        { signal: AbortSignal.timeout(DASHBOARD_FETCH_TIMEOUT_MS) }
       );
 
       if (dashRes.status === 401) {
         // Stay signed in — only log out when the user clicks Logout.
         setAuthExpired(true);
+        parkRetry();
         return;
       }
 
       if (dashRes.status === 429) {
         setRateLimited(true);
+        parkRetry();
         return;
       }
 
       setRateLimited(false);
       setAuthExpired(false);
+      // Non-OK responses (500 JSON errors, proxy 502 HTML) must not be
+      // silently treated as an empty-but-successful dashboard.
+      if (!dashRes.ok) {
+        throw new Error(`Dashboard request failed (HTTP ${dashRes.status})`);
+      }
       const dashData = await dashRes.json();
+
+      // The server now reports rebuilds and explicit errors on an OK response —
+      // surface them instead of treating the (possibly stale) payload as fresh.
+      if (dashData.error) {
+        console.warn("Dashboard degraded:", dashData.error);
+      }
+      const rebuilding = dashData.rebuilding === true;
+      if (dashData.error && !rebuilding) {
+        throw new Error(dashData.error);
+      }
+
+      syncFailedRef.current = false;
+      failCountRef.current = 0;
+      setFailCount(0);
+      setSyncFailed(false);
 
       setProjects(dashData.projects || []);
       setOfflineDevices(dashData.offlineDevices || []);
@@ -452,23 +510,32 @@ export default function Dashboard() {
           ? dashData.nextUpdateInSeconds
           : interval;
       const now = Date.now();
-      let next = readNextRefreshAt();
+      let next: number;
       if (limited.length > 0) {
         // A credential is cooling down — the server answers from cache and
         // makes no Ruijie calls, so poll fast and drop the banner as soon as
         // the cooldown lifts instead of waiting out a full status cycle.
         next = now + FAST_POLL_SECONDS * 1000;
-        writeNextRefreshAt(next);
-        setLastRefresh(new Date(now));
-      } else if (force || !next || next <= now) {
-        // Keep the running window across page switches unless forced or expired.
+      } else if (rebuilding) {
+        // The rebuild is still running in the background — poll again when the
+        // server says to (30s) so we pick up the fresh payload when it lands.
         next = now + updateIn * 1000;
-        writeNextRefreshAt(next);
-        setLastRefresh(new Date(next - updateIn * 1000));
+      } else {
+        // Keep the running window across page switches unless forced or expired.
+        const prev = readNextRefreshAt();
+        if (!force && prev && prev > now) {
+          next = prev;
+        } else {
+          next = now + updateIn * 1000;
+        }
       }
+      writeNextRefreshAt(next);
       setRefreshCountdown(secondsUntil(next));
     } catch (error) {
       console.error("Error fetching dashboard:", error);
+      syncFailedRef.current = true;
+      setSyncFailed(true);
+      parkRetry();
     } finally {
       inFlightRef.current = false;
       setRefreshing(false);
@@ -485,7 +552,6 @@ export default function Dashboard() {
     const next = readNextRefreshAt();
     if (next && next > Date.now()) {
       setRefreshCountdown(secondsUntil(next));
-      setLastRefresh(new Date(next - DEFAULT_INTERVAL_SECONDS * 1000));
     }
   }, []);
 
@@ -557,7 +623,14 @@ export default function Dashboard() {
       const secs = secondsUntil(next);
       setRefreshCountdown(secs);
       // Countdown just hit zero → the sync cycle finished: sound the alarm.
-      if (secs === 0 && prevCountdownRef.current !== null && prevCountdownRef.current > 0) {
+      // Skipped while a sync is failing — the zero is just the retry window
+      // expiring, not a completed refresh.
+      if (
+        secs === 0 &&
+        prevCountdownRef.current !== null &&
+        prevCountdownRef.current > 0 &&
+        !syncFailedRef.current
+      ) {
         startBeepSession();
       }
       prevCountdownRef.current = secs;
@@ -695,12 +768,13 @@ export default function Dashboard() {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            {lastRefresh && (
-              <span className="text-xs text-gray-500">
-                Updating in {Math.floor(refreshCountdown / 60)}:
-                {String(refreshCountdown % 60).padStart(2, "0")}
-              </span>
-            )}
+            {/* Always rendered — a failed/ pending first fetch previously hid
+                the countdown entirely (lastRefresh gate) and, with no deadline
+                written, left it with nothing to count down to. */}
+            <span className="text-xs text-gray-500">
+              Updating in {Math.floor(refreshCountdown / 60)}:
+              {String(refreshCountdown % 60).padStart(2, "0")}
+            </span>
             <button
               onClick={() => fetchAll(true)}
               disabled={refreshDisabled}
@@ -798,6 +872,21 @@ export default function Dashboard() {
             <p className="text-yellow-800 font-medium">Rate limited by Ruijie API</p>
             <p className="text-yellow-700 text-sm">
               Auto-refresh paused. Wait a few minutes then click Sync Data.
+            </p>
+          </div>
+        )}
+
+        {syncFailed && (
+          <div className="shrink-0 bg-red-50 border border-red-200 rounded-lg p-4">
+            <p className="text-red-800 font-medium">
+              Sync failed — retrying in{" "}
+              {SYNC_RETRY_BACKOFF_SECONDS[
+                Math.min(failCount - 1, SYNC_RETRY_BACKOFF_SECONDS.length - 1)
+              ] ?? SYNC_RETRY_BACKOFF_SECONDS[0]}
+              s.
+            </p>
+            <p className="text-red-700 text-sm">
+              Dashboard data may be outdated. This page retries automatically.
             </p>
           </div>
         )}
@@ -911,7 +1000,7 @@ export default function Dashboard() {
               >
                 {offlineByProvince.length === 0 ? (
                   <div className="p-6 text-center text-sm text-green-600">
-                    All sites online!
+                    {loading || refreshing ? "Loading..." : "All sites online!"}
                   </div>
                 ) : (
                   offlineByProvince.map(({ label, count }) => (
@@ -958,7 +1047,7 @@ export default function Dashboard() {
               >
                 {offlineByProject.length === 0 ? (
                   <div className="p-6 text-center text-sm text-green-600">
-                    All sites online!
+                    {loading || refreshing ? "Loading..." : "All sites online!"}
                   </div>
                 ) : (
                   offlineByProject.map(({ label, count }) => (
@@ -1010,7 +1099,7 @@ export default function Dashboard() {
                   </div>
                 ) : sortedOfflineSites.length === 0 ? (
                   <div className="p-12 text-center text-green-600">
-                    All sites online!
+                    {refreshing ? "Syncing..." : "All sites online!"}
                   </div>
                 ) : (
                   sortedOfflineSites.map((site) => {
@@ -1079,7 +1168,7 @@ export default function Dashboard() {
                   <>
                     {sortedOfflineDevices.length === 0 && (
                       <div className="p-12 text-center text-green-600">
-                        All devices are online!
+                        {refreshing ? "Syncing..." : "All devices are online!"}
                       </div>
                     )}
                     {sortedOfflineDevices.map((device) => {
