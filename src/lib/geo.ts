@@ -1,11 +1,17 @@
-import { cacheGet, cacheSet } from "@/lib/cache";
-import { diskGet, diskSet } from "@/lib/disk-cache";
+import { cacheClear, cacheGet, cacheSet } from "@/lib/cache";
+import { diskDelete, diskGet, diskSet } from "@/lib/disk-cache";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 
 /** Province labels do not change — cache essentially forever. */
 const TTL_PROVINCE_MS = 365 * 24 * 60 * 60_000;
 /** Failed lookups only — retry soon; never write these to disk. */
 const TTL_NEGATIVE_MS = 10 * 60_000;
+/**
+ * A site-name geocode that answered 200-but-no-hit is usually a bad first
+ * pass (typo rules, out-of-bbox rejection), not a permanently unplaceable
+ * site — cache the miss for a week, not a year, so improved queries retry.
+ */
+const TTL_GEOCODE_MISS_MS = 7 * 24 * 60 * 60_000;
 
 /**
  * Durable Supabase cache — survives Netlify's ephemeral / read-only
@@ -42,6 +48,18 @@ function geoDbSet<T>(key: string, value: T): void {
       .catch(() => undefined);
   } catch {
     // env not ready / table missing — ignore, memory + disk still hold it
+  }
+}
+
+/** Drop a bad cache entry from the durable layer (best-effort). */
+function geoDbDelete(key: string): void {
+  try {
+    const sb = getSupabaseServiceRole();
+    void Promise.resolve(sb.from("geo_cache").delete().eq("key", key))
+      .then(() => undefined)
+      .catch(() => undefined);
+  } catch {
+    // env not ready / table missing — ignore
   }
 }
 
@@ -230,11 +248,12 @@ const PROVINCE_HINTS: Array<{
   },
   // PFIAPSC sites are Camiguin provincial projects.
   { re: /^PFIAPSC\b/i, province: "Camiguin", bbox: [9.0, 124.4, 9.4, 125.1] },
-  // PICS spans Northern Mindanao (Lanao / MisOr / CDO) — bbox-only.
-  // Do not use \b after PHASE: PHASE3 has no boundary between E and 3.
+  // PICS spans Northern Mindanao (Lanao / MisOr / CDO) — scoped + bbox so the
+  // runtime passes match what scripts/warm-geocode.mjs writes into the cache.
   {
     re: /^DICT\s*PICS\b/i,
     bbox: [7.3, 123.4, 9.3, 125.5],
+    region: "Northern Mindanao",
   },
   {
     re: /^DICT[\s_-]*PHASE/i,
@@ -383,29 +402,54 @@ export async function geocodeSiteName(
   groupId: number
 ): Promise<SiteGeo | null> {
   const key = `geo:site-name:${groupId}`;
+  const hint = provinceHintFor(siteName);
+
+  // Cached coordinates were trusted blindly for up to a year — an older
+  // query pass ("underscore era") wrote out-of-bbox hits that then fed the
+  // wrong province to every offline site. Re-validate each hit against the
+  // PH box and the name hint's bbox (same gates a fresh hit must pass) and
+  // purge anything invalid from every layer so it re-geocodes below.
+  const invalidHit = (v: SiteGeo | null): v is SiteGeo =>
+    v != null &&
+    (!isValidSiteGeo(v.latitude, v.longitude) ||
+      (hint != null && !inBbox(v.latitude, v.longitude, hint.bbox)));
 
   const mem = cacheGet<SiteGeo | null>(key);
-  if (mem !== undefined) return mem;
-
-  const disk = diskGet<SiteGeo | null>(key);
-  if (disk !== undefined) {
-    cacheSet(key, disk, TTL_PROVINCE_MS);
-    // Backfill Supabase from a warm local disk cache so Netlify can read it.
-    if (disk) geoDbSet(key, disk);
-    return disk;
-  }
-
-  // Durable Supabase layer — survives Netlify cold starts where disk fails.
-  const db = await geoDbGet<SiteGeo>(key);
-  if (db !== undefined) {
-    cacheSet(key, db, TTL_PROVINCE_MS);
-    diskSet(key, db);
-    return db;
+  if (mem !== undefined) {
+    if (!invalidHit(mem)) return mem;
+    cacheClear(key);
+    diskDelete(key);
+    geoDbDelete(key);
+  } else {
+    const disk = diskGet<SiteGeo | null>(key);
+    if (disk !== undefined) {
+      // A null on disk/db was written by the old "permanent-negative" code
+      // (disk has no TTL, so it would block retries forever) — purge it and
+      // re-geocode, same as scripts/warm-geocode.mjs does offline.
+      if (disk !== null && !invalidHit(disk)) {
+        cacheSet(key, disk, TTL_PROVINCE_MS);
+        // Backfill Supabase from a warm local disk cache so Netlify can read it.
+        geoDbSet(key, disk);
+        return disk;
+      }
+      diskDelete(key);
+      geoDbDelete(key);
+    } else {
+      // Durable Supabase layer — survives Netlify cold starts where disk fails.
+      const db = await geoDbGet<SiteGeo>(key);
+      if (db !== undefined) {
+        if (db !== null && !invalidHit(db)) {
+          cacheSet(key, db, TTL_PROVINCE_MS);
+          diskSet(key, db);
+          return db;
+        }
+        geoDbDelete(key);
+      }
+    }
   }
 
   const started = Date.now();
   let okResponses = 0;
-  const hint = provinceHintFor(siteName);
   try {
     const queries = siteNameQueries(siteName).slice(0, GEOCODE_MAX_ATTEMPTS);
     for (let i = 0; i < queries.length; i++) {
@@ -449,11 +493,12 @@ export async function geocodeSiteName(
       return null;
     }
 
-    // Every completed query was HTTP 200 with no PH hit — place name will
-    // not resolve; permanent-negative is safe and avoids re-querying forever.
+    // Every completed query was HTTP 200 with no PH hit — the place name did
+    // not resolve under the rules as they stand. Cache the miss for a week in
+    // memory ONLY (disk/Supabase nulls never expire and would make this
+    // permanent again) so a later pass with improved queries can retry.
     if (okResponses > 0) {
-      cacheSet(key, null, TTL_PROVINCE_MS);
-      diskSet(key, null);
+      cacheSet(key, null, TTL_GEOCODE_MISS_MS);
       return null;
     }
 

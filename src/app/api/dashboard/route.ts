@@ -1269,6 +1269,20 @@ async function buildDashboard(
     // Persisted (24h freshness) so restarts and rate-limit holds don't reset
     // every shared site's offline-days clock.
     loadOutageStarts();
+    // The disk map above is per-instance and ephemeral on Netlify — a cold
+    // start would reset every aggregate-only site's clock to "now". Re-seed
+    // from the previous payload (memory or durable Supabase copy) which
+    // already carries each site's tracked oldestOffline.
+    if (opts?.prev?.projects?.length) {
+      for (const prevP of opts.prev.projects) {
+        if (!outageStarts.has(prevP.groupId) && prevP.oldestOffline) {
+          outageStarts.set(prevP.groupId, {
+            startedAt: prevP.oldestOffline,
+            lastSeenAt: Date.now(),
+          });
+        }
+      }
+    }
     const observedAt = Date.now();
     let outageDirty = false;
     for (const p of allProjects) {
@@ -1279,12 +1293,20 @@ async function buildDashboard(
       }
       const derived = oldestOfflineFromDevices(p.devices);
       if (derived > 0) {
-        const known = outageStarts.get(p.groupId)?.startedAt;
-        outageStarts.set(p.groupId, {
-          startedAt: known && known < derived ? known : derived,
-          lastSeenAt: observedAt,
-        });
-        p.oldestOffline = derived;
+        // A stale entry (unseen > 24h) belongs to a previous, already-closed
+        // outage — its recovery was simply never observed. Drop it instead
+        // of letting it wrongly extend the current outage's start.
+        const entry = outageStarts.get(p.groupId);
+        const known =
+          entry && observedAt - entry.lastSeenAt < OUTAGE_ENTRY_MAX_AGE_MS
+            ? entry.startedAt
+            : undefined;
+        // Keep the OLDEST continuous outage start: a device rebooting (its
+        // lastOnline moving forward) must not shrink the site's downtime
+        // while another device has been down longer.
+        const startedAt = known && known < derived ? known : derived;
+        outageStarts.set(p.groupId, { startedAt, lastSeenAt: observedAt });
+        p.oldestOffline = startedAt;
       } else {
         const known = outageStarts.get(p.groupId);
         const startedAt =

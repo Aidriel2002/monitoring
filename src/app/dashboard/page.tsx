@@ -283,10 +283,15 @@ function getSiteOldestOffline(site: Project): number {
   const times = site.devices
     .filter((d) => d.onlineStatus !== "ON" && d.lastOnline > 0)
     .map((d) => d.lastOnline);
-  if (times.length > 0) return Math.min(...times);
+  const fromDevices = times.length > 0 ? Math.min(...times) : 0;
   // Shared projects whose device history is denied still carry the outage
   // start the server tracked from aggregate counts.
-  return site.oldestOffline || 0;
+  const tracked = site.oldestOffline || 0;
+  // Prefer the older of the two: the server tracks the CONTINUOUS outage
+  // start across device reboots (a rebooted device's lastOnline moves
+  // forward), while the device rows only show the current slice.
+  if (tracked > 0 && fromDevices > 0) return Math.min(tracked, fromDevices);
+  return tracked > 0 ? tracked : fromDevices;
 }
 
 /** Count offline sites per label (province / credential), count-descending. */
