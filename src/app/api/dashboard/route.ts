@@ -261,8 +261,16 @@ const REVALIDATE_POLL_SECONDS = 30;
 /**
  * One rebuild per user across concurrent polls — without this every tab and
  * every retry stacks its own full Ruijie rebuild (quota + duration multiply).
+ * Entries carry a start time: a rebuild the host froze (Netlify can suspend
+ * after() work mid-flight, leaving the promise unsettled forever) is abandoned
+ * after REBUILD_ABANDON_MS so the next poll starts a fresh one instead of
+ * re joining a dead promise and reporting `rebuilding` indefinitely.
  */
-const activeRebuilds = new Map<string, Promise<DashboardPayload>>();
+const REBUILD_ABANDON_MS = 60_000;
+const activeRebuilds = new Map<
+  string,
+  { promise: Promise<DashboardPayload>; startedAt: number }
+>();
 
 /**
  * Build the payload, park it in the in-memory cache (short TTL when
@@ -279,8 +287,11 @@ async function runRebuild(
   opts: { forceGeo?: boolean; prev?: DashboardPayload }
 ): Promise<DashboardPayload> {
   const existing = activeRebuilds.get(cacheKey);
-  if (existing) return existing;
+  if (existing && Date.now() - existing.startedAt < REBUILD_ABANDON_MS) {
+    return existing.promise;
+  }
 
+  const startedAt = Date.now();
   const tracked = (async () => {
     const started = Date.now();
     const fresh = await buildDashboard(creds, {
@@ -304,9 +315,14 @@ async function runRebuild(
         ` healthy=${healthy} degraded=${fresh.degraded}`
     );
     return fresh;
-  })().finally(() => activeRebuilds.delete(cacheKey));
+  })().finally(() => {
+    // Only clear if this rebuild is still the active one — an abandoned
+    // rebuild that settles late must not delete its replacement's entry.
+    const cur = activeRebuilds.get(cacheKey);
+    if (cur && cur.startedAt === startedAt) activeRebuilds.delete(cacheKey);
+  });
 
-  activeRebuilds.set(cacheKey, tracked);
+  activeRebuilds.set(cacheKey, { promise: tracked, startedAt });
   tracked.catch(() => undefined);
   return tracked;
 }
@@ -608,24 +624,26 @@ export async function GET(request: Request) {
     // Next-update signal. For a healthy payload, report an ABSOLUTE deadline
     // (builtAt + status TTL) so every device on this account counts down to
     // the SAME moment — a relative "full interval" countdown drifted per
-    // device. For rebuilding / rate-limited responses, report a near-future
-    // poll target so the client picks up the fresh payload (or lifted
-    // cooldown) promptly.
+    // device. Rate-limited responses get a short poll so the banner drops as
+    // soon as the cooldown lifts.
     const builtAtForNext =
       typeof response.builtAt === "number" ? response.builtAt : Date.now();
     const rateLimitedNow = response.rateLimitedCredentials.length > 0;
     let nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
     let nextUpdateAt = builtAtForNext + DASHBOARD_TTL_MS;
-    if (rebuilding) {
-      nextUpdateInSeconds = REVALIDATE_POLL_SECONDS;
-      nextUpdateAt = Date.now() + REVALIDATE_POLL_SECONDS * 1000;
-    } else if (rateLimitedNow || response.degraded) {
+    if (rateLimitedNow || response.degraded) {
       nextUpdateInSeconds = Math.ceil(DEGRADED_TTL_MS / 1000);
       nextUpdateAt = Date.now() + DEGRADED_TTL_MS;
-    } else if (nextUpdateAt <= Date.now()) {
-      // At/past TTL — the next fetch triggers a rebuild.
-      nextUpdateInSeconds = REVALIDATE_POLL_SECONDS;
-      nextUpdateAt = Date.now() + REVALIDATE_POLL_SECONDS * 1000;
+    } else if (rebuilding || nextUpdateAt <= Date.now()) {
+      // Stale-but-usable payload served while a rebuild runs (or one whose
+      // TTL just passed). Keep the FULL status cadence rather than a 30s
+      // poll: the background rebuild either lands and the realtime broadcast
+      // pushes it, or the next cycle picks it up. A flat 30s here stuck the
+      // countdown at 0:30 whenever the host froze the rebuild (Netlify), and
+      // pinned activeRebuilds made that permanent. The empty first-build
+      // case is answered earlier with a short poll.
+      nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
+      nextUpdateAt = Date.now() + DEVICE_STATUS_INTERVAL_SECONDS * 1000;
     }
 
     return applyRefreshedAuth(
