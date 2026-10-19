@@ -621,29 +621,27 @@ export async function GET(request: Request) {
       cacheSet(cacheKey, response, ttl);
     }
 
-    // Next-update signal. For a healthy payload, report an ABSOLUTE deadline
-    // (builtAt + status TTL) so every device on this account counts down to
-    // the SAME moment — a relative "full interval" countdown drifted per
-    // device. Rate-limited responses get a short poll so the banner drops as
-    // soon as the cooldown lifts.
-    const builtAtForNext =
-      typeof response.builtAt === "number" ? response.builtAt : Date.now();
+    // Next-update signal. Report an ABSOLUTE deadline so every device on this
+    // account counts down to the SAME moment. A per-response `Date.now() +
+    // interval` (or a stale `builtAt + TTL` window) drifted by whenever each
+    // device happened to fetch, so phones/laptops never agreed on the time.
+    //
+    // The deadline is the next epoch-aligned grid point (a multiple of the
+    // status interval past now). `floor(now / interval) * interval + interval`
+    // is always strictly greater than `now` and identical for every device that
+    // computes it at roughly the same moment, so the countdown is synchronized.
+    // It also unifies the rebuilding case: a stale payload no longer returns a
+    // per-client `Date.now() + interval`.
     const rateLimitedNow = response.rateLimitedCredentials.length > 0;
+    const intervalMs = DEVICE_STATUS_INTERVAL_SECONDS * 1000;
+    const nextGrid =
+      Math.floor(Date.now() / intervalMs) * intervalMs + intervalMs;
     let nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
-    let nextUpdateAt = builtAtForNext + DASHBOARD_TTL_MS;
+    let nextUpdateAt = nextGrid;
     if (rateLimitedNow || response.degraded) {
+      // Short poll so the banner drops as soon as the cooldown lifts.
       nextUpdateInSeconds = Math.ceil(DEGRADED_TTL_MS / 1000);
       nextUpdateAt = Date.now() + DEGRADED_TTL_MS;
-    } else if (rebuilding || nextUpdateAt <= Date.now()) {
-      // Stale-but-usable payload served while a rebuild runs (or one whose
-      // TTL just passed). Keep the FULL status cadence rather than a 30s
-      // poll: the background rebuild either lands and the realtime broadcast
-      // pushes it, or the next cycle picks it up. A flat 30s here stuck the
-      // countdown at 0:30 whenever the host froze the rebuild (Netlify), and
-      // pinned activeRebuilds made that permanent. The empty first-build
-      // case is answered earlier with a short poll.
-      nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
-      nextUpdateAt = Date.now() + DEVICE_STATUS_INTERVAL_SECONDS * 1000;
     }
 
     return applyRefreshedAuth(

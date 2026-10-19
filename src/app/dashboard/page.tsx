@@ -735,6 +735,15 @@ export default function Dashboard() {
   const totalOnline = projects.reduce((sum, p) => sum + p.onlineCount, 0);
   const totalOffline = projects.reduce((sum, p) => sum + p.offlineCount, 0);
   const sitesOnline = projects.length - offlineSites.length;
+  // Only sites where EVERY device is offline count as "Offline sites" in the
+  // top bar. Partially-offline sites (some devices up) still appear in the
+  // list/panel with a "Partially offline" badge but are excluded from this count.
+  const fullyOfflineSites = offlineSites.filter(
+    (s) => s.onlineCount === 0
+  ).length;
+  const partiallyOfflineSites = offlineSites.filter(
+    (s) => s.onlineCount > 0
+  ).length;
   const sitesPct =
     projects.length > 0 ? (sitesOnline / projects.length) * 100 : 0;
   const devicesPct =
@@ -941,9 +950,17 @@ export default function Dashboard() {
             </div>
             <div>
               <p className="text-3xl font-bold leading-none text-red-500">
-                {offlineSites.length}
+                {fullyOfflineSites}
               </p>
               <p className="text-xs text-gray-500 mt-1.5">Offline sites</p>
+            </div>
+            <div>
+              <p className="text-3xl font-bold leading-none text-amber-600">
+                {partiallyOfflineSites}
+              </p>
+              <p className="text-xs text-gray-500 mt-1.5">
+                Partially offline
+              </p>
             </div>
             <div>
               <p className="text-3xl font-bold leading-none text-gray-900">
