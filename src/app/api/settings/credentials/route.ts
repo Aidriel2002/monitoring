@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import { cacheClear } from "@/lib/cache";
 import { durableClear } from "@/lib/dashboard-cache";
-import { expandSelectionToLeaves, fetchProjectTree } from "@/lib/ruijie";
+import { expandSelectionToLeaves, fetchProjectTree, getRateLimitStatus } from "@/lib/ruijie";
 import { parseProjectsCache } from "@/lib/projects-cache";
 
 async function getUser(request: Request) {
@@ -46,7 +46,6 @@ export async function GET(request: Request) {
         const {
           secret,
           bootstrap_token,
-          base_url,
           projects_cache,
           ...pub
         } = cred as {
@@ -55,11 +54,24 @@ export async function GET(request: Request) {
           base_url: string | null;
           projects_cache?: unknown;
         } & Record<string, unknown>;
+        // Live cooldown state (in-memory, per instance) — powers the
+        // "API limit reached" badge in the API Credentials tab.
+        const limit = getRateLimitStatus({
+          appId: cred.app_id as string,
+          secret,
+          bootstrapToken: bootstrap_token || undefined,
+          baseUrl: (pub.base_url as string | null) || undefined,
+        });
+        const rateLimit = {
+          rate_limited_until: limit.limited
+            ? Date.now() + limit.retryInSeconds * 1000
+            : 0,
+        };
         if (cred.selected_group_ids === null || cred.selected_group_ids === undefined) {
-          return pub;
+          return { ...pub, ...rateLimit };
         }
         // Disabled credentials are never called — no tree expansion either.
-        if (cred.is_active === false) return pub;
+        if (cred.is_active === false) return { ...pub, ...rateLimit };
         try {
           // Prefer the snapshot persisted by Sync devices — hitting Ruijie's
           // live tree on every Settings load burned quota, and a failure
@@ -71,10 +83,11 @@ export async function GET(request: Request) {
                 appId: cred.app_id as string,
                 secret,
                 bootstrapToken: bootstrap_token || undefined,
-                baseUrl: base_url || undefined,
+                baseUrl: pub.base_url || undefined,
               });
           return {
             ...pub,
+            ...rateLimit,
             selected_group_ids: expandSelectionToLeaves(
               tree,
               cred.selected_group_ids as number[] | null
@@ -83,7 +96,7 @@ export async function GET(request: Request) {
         } catch {
           // Tree unavailable — keep the raw saved selection (pub already
           // carries it) rather than reporting "all" for a saved subset.
-          return pub;
+          return { ...pub, ...rateLimit };
         }
       })
     );

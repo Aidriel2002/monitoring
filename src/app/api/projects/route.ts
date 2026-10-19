@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
-import { getProjects, RuijieCredentials } from "@/lib/ruijie";
+import {
+  getProjects,
+  getRateLimitStatus,
+  isRateLimitError,
+  RuijieCredentials,
+} from "@/lib/ruijie";
 
 async function getUser(request: Request) {
   const cookieHeader = request.headers.get("cookie") || "";
@@ -70,14 +75,13 @@ export async function GET(request: Request) {
     const errors = [];
 
     for (const cred of activeCreds) {
+      const credentials: RuijieCredentials = {
+        appId: cred.app_id,
+        secret: cred.secret,
+        bootstrapToken: cred.bootstrap_token || undefined,
+        baseUrl: cred.base_url || undefined,
+      };
       try {
-        const credentials: RuijieCredentials = {
-          appId: cred.app_id,
-          secret: cred.secret,
-          bootstrapToken: cred.bootstrap_token || undefined,
-          baseUrl: cred.base_url || undefined,
-        };
-
         const projects = await getProjects(credentials);
         allProjects.push(
           ...projects.map((p) => ({
@@ -91,6 +95,8 @@ export async function GET(request: Request) {
           credentialId: cred.id,
           credentialName: cred.name,
           error: error instanceof Error ? error.message : "Unknown error",
+          rateLimited: isRateLimitError(error),
+          retryInSeconds: getRateLimitStatus(credentials).retryInSeconds,
         });
       }
     }
@@ -98,9 +104,13 @@ export async function GET(request: Request) {
     // For test mode, return after first credential
     if (isTest) {
       if (errors.length > 0 && allProjects.length === 0) {
+        const first = errors[0];
         return NextResponse.json(
-          { error: errors[0].error },
-          { status: 400 }
+          {
+            error: first.error,
+            retryInSeconds: first.rateLimited ? first.retryInSeconds : undefined,
+          },
+          { status: first.rateLimited ? 429 : 400 }
         );
       }
     }

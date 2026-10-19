@@ -17,6 +17,8 @@ interface Credential {
   created_at: string;
   selected_group_ids: number[] | null;
   selected_received_group_ids: number[] | null;
+  /** Epoch ms until which Ruijie is rate-limiting this credential (0 = none). */
+  rate_limited_until?: number;
 }
 
 interface Project {
@@ -192,6 +194,8 @@ export default function SettingsPage() {
   const [togglingCred, setTogglingCred] = useState<string | null>(null);
   /** credId → epoch ms of last successful/started fetch (1/minute spam guard). */
   const [fetchCooldownUntil, setFetchCooldownUntil] = useState<Record<string, number>>({});
+  /** credId → epoch ms until which the Ruijie API limit is active for it. */
+  const [rateLimitedUntil, setRateLimitedUntil] = useState<Record<string, number>>({});
   const [fetchCooldownTick, setFetchCooldownTick] = useState(0);
   const [managingCredId, setManagingCredId] = useState<string | null>(null);
   const manageRef = useRef<HTMLDivElement>(null);
@@ -233,21 +237,40 @@ export default function SettingsPage() {
     return () => document.removeEventListener("mousedown", onDocClick);
   }, []);
 
-  // Tick cooldown labels once per second while any Sync devices cooldown is active.
+  // Tick cooldown labels once per second while any Sync devices cooldown or
+  // API rate limit is active.
   useEffect(() => {
-    const hasActive = Object.values(fetchCooldownUntil).some(
-      (until) => until > Date.now()
-    );
+    const hasActive =
+      Object.values(fetchCooldownUntil).some((until) => until > Date.now()) ||
+      Object.values(rateLimitedUntil).some((until) => until > Date.now());
     if (!hasActive) return;
     const timer = setInterval(() => setFetchCooldownTick((t) => t + 1), 1000);
     return () => clearInterval(timer);
-  }, [fetchCooldownUntil]);
+  }, [fetchCooldownUntil, rateLimitedUntil]);
 
   function fetchDevicesCooldownSec(credId: string): number {
     void fetchCooldownTick;
     const until = fetchCooldownUntil[credId] || 0;
     const remain = Math.ceil((until - Date.now()) / 1000);
     return remain > 0 ? remain : 0;
+  }
+
+  /** Remaining seconds of the Ruijie API rate limit for this credential. */
+  function rateLimitedSec(credId: string): number {
+    void fetchCooldownTick;
+    const until = rateLimitedUntil[credId] || 0;
+    const remain = Math.ceil((until - Date.now()) / 1000);
+    return remain > 0 ? remain : 0;
+  }
+
+  function markRateLimited(credId: string, retryInSeconds: number) {
+    const until = Date.now() + Math.max(1, retryInSeconds) * 1000;
+    setRateLimitedUntil((prev) => ({ ...prev, [credId]: until }));
+    // Block Sync devices for the same window so the button counts down too.
+    setFetchCooldownUntil((prev) => ({
+      ...prev,
+      [credId]: Math.max(prev[credId] || 0, until),
+    }));
   }
 
   function fetchDevicesDisabled(cred: Credential): boolean {
@@ -292,6 +315,14 @@ export default function SettingsPage() {
       setAuthExpired(false);
       const data = await response.json();
       setCredentials(data.credentials || []);
+
+      // Seed the per-credential API limit countdowns from the server's
+      // live cooldown state.
+      const limits: Record<string, number> = {};
+      for (const cred of data.credentials || []) {
+        limits[cred.id] = cred.rate_limited_until || 0;
+      }
+      setRateLimitedUntil(limits);
 
       // Initialize selected IDs from DB
       const initialSelected: Record<string, number[] | null> = {};
@@ -406,6 +437,11 @@ export default function SettingsPage() {
       const data = await response.json();
       if (response.ok && data.projects) {
         updateToast(toastId, "success", `OK - ${data.projects.length} project(s) found`);
+      } else if (response.status === 429) {
+        if (typeof data.retryInSeconds === "number" && data.retryInSeconds > 0) {
+          markRateLimited(cred.id, data.retryInSeconds);
+        }
+        updateToast(toastId, "error", `API limit reached: ${data.error || "try again shortly"}`);
       } else {
         updateToast(toastId, "error", `Error: ${data.error || "Unknown error"}`);
       }
@@ -462,6 +498,17 @@ export default function SettingsPage() {
           delete next[cred.id];
           return next;
         });
+      } else if (response.status === 429) {
+        // Ruijie quota/rate limit — show it on the credential row and time
+        // the retry from the server's remaining cooldown.
+        if (typeof data.retryInSeconds === "number" && data.retryInSeconds > 0) {
+          markRateLimited(cred.id, data.retryInSeconds);
+        }
+        updateToast(
+          toastId,
+          "error",
+          `API limit reached: ${data.error || "try again shortly"}`
+        );
       } else {
         updateToast(toastId, "error", `Error: ${data.error || "Unknown error"}`);
         // Failed fetch — allow retry after a short pause instead of full minute.
@@ -752,6 +799,14 @@ export default function SettingsPage() {
                         {!cred.is_active && (
                           <span className="ml-2 align-middle text-xs font-medium text-white bg-gray-500 rounded px-1.5 py-0.5">
                             Disabled
+                          </span>
+                        )}
+                        {rateLimitedSec(cred.id) > 0 && (
+                          <span
+                            className="ml-2 align-middle text-xs font-medium text-white bg-amber-500 rounded px-1.5 py-0.5"
+                            title="Ruijie API rate limit / quota reached for this credential — wait for the countdown before syncing or testing"
+                          >
+                            API limit reached ({rateLimitedSec(cred.id)}s)
                           </span>
                         )}
                       </h3>

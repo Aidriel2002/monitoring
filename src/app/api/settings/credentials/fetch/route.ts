@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseServiceRole } from "@/lib/supabase";
 import {
   fetchProjectTree,
+  getRateLimitStatus,
   getReceivedProjects,
+  isRateLimitError,
   refreshCredentialInventory,
   RuijieCredentials,
 } from "@/lib/ruijie";
@@ -36,6 +38,7 @@ async function getUser(request: Request) {
  * next dashboard load shows new devices/sites.
  */
 export async function POST(request: NextRequest) {
+  let credentials: RuijieCredentials | undefined;
   try {
     const user = await getUser(request);
     if (!user) {
@@ -72,7 +75,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const credentials: RuijieCredentials = {
+    credentials = {
       appId: cred.app_id,
       secret: cred.secret,
       bootstrapToken: cred.bootstrap_token || undefined,
@@ -128,6 +131,20 @@ export async function POST(request: NextRequest) {
       ...result,
     });
   } catch (error) {
+    // A quota/rate-limit hit is not a server error — surface it as 429 with
+    // the remaining cooldown so the UI can show "API limit reached" and time
+    // the retry instead of guessing from a generic 500 message.
+    if (isRateLimitError(error)) {
+      const status = credentials ? getRateLimitStatus(credentials) : null;
+      return NextResponse.json(
+        {
+          error:
+            error instanceof Error ? error.message : "Ruijie rate limited",
+          retryInSeconds: status?.retryInSeconds || 0,
+        },
+        { status: 429 }
+      );
+    }
     return NextResponse.json(
       {
         error:

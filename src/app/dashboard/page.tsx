@@ -494,9 +494,18 @@ export default function Dashboard() {
       setFailCount(0);
       setSyncFailed(false);
 
-      setProjects(dashData.projects || []);
-      setOfflineDevices(dashData.offlineDevices || []);
-      setOfflineSites(dashData.offlineSites || []);
+      // A rebuild-in-progress response carries empty arrays when the build
+      // has not finished yet. Replacing good data with those empties blanked
+      // the whole dashboard ("rebuild did not finish") until the next poll —
+      // keep the previous payload and let the polling pick up the fresh one.
+      const nextProjects = dashData.projects || [];
+      const nextOfflineDevices = dashData.offlineDevices || [];
+      const nextOfflineSites = dashData.offlineSites || [];
+      if (!(rebuilding && nextProjects.length === 0)) {
+        setProjects(nextProjects);
+        setOfflineDevices(nextOfflineDevices);
+        setOfflineSites(nextOfflineSites);
+      }
       const limited = dashData.rateLimitedCredentials || [];
       setLimitedCreds(limited);
 
@@ -516,7 +525,13 @@ export default function Dashboard() {
           : interval;
       const now = Date.now();
       let next: number;
-      if (limited.length > 0) {
+      if (typeof dashData.nextUpdateAt === "number" && dashData.nextUpdateAt > now) {
+        // Absolute deadline from the server. For a healthy payload this is
+        // shared by every device on the account (builtAt + status TTL), so the
+        // update time is unified instead of drifting per device; for rebuilding
+        // / rate-limited responses it is a near-future poll target.
+        next = dashData.nextUpdateAt;
+      } else if (limited.length > 0) {
         // A credential is cooling down — the server answers from cache and
         // makes no Ruijie calls, so poll fast and drop the banner as soon as
         // the cooldown lifts instead of waiting out a full status cycle.
@@ -1124,10 +1139,23 @@ export default function Dashboard() {
                             <h3 className="truncate text-xs font-semibold text-gray-900">
                               {site.name}
                             </h3>
-                            <span
-                              className={`mt-1 inline-flex items-center max-w-[6.5rem] truncate px-1.5 py-0.5 rounded text-[9px] font-semibold ${provinceBadgeClass(site.province)}`}
-                            >
-                              {site.province || "Unknown"}
+                            <span className="mt-1 inline-flex items-center gap-1 min-w-0">
+                              <span
+                                className={`inline-flex items-center max-w-[6.5rem] truncate px-1.5 py-0.5 rounded text-[9px] font-semibold ${provinceBadgeClass(site.province)}`}
+                              >
+                                {site.province || "Unknown"}
+                              </span>
+                              <span
+                                className={`inline-flex items-center shrink-0 px-1.5 py-0.5 rounded text-[9px] font-semibold ${
+                                  site.onlineCount > 0
+                                    ? "bg-amber-100 text-amber-700"
+                                    : "bg-red-100 text-red-700"
+                                }`}
+                              >
+                                {site.onlineCount > 0
+                                  ? "Partially offline"
+                                  : "All offline"}
+                              </span>
                             </span>
                           </div>
                           <div className="shrink-0 text-right min-w-[5.5rem] whitespace-nowrap">

@@ -326,16 +326,38 @@ function buildProjectTree(node: GroupTreeNode): ProjectTreeNode | null {
   };
 }
 
+/**
+ * Raw group tree — one cached live call shared by fetchProjectTree, projects,
+ * and fleet root resolution. Previously each caller had its own cache key for
+ * the same endpoint, so one Sync devices click burned 3 identical tree calls.
+ */
+function fetchGroupTreeRaw(creds: RuijieCredentials): Promise<{
+  code: number;
+  msg: string;
+  groupId?: number;
+  rootGroupId?: number;
+  groups: GroupTreeNode;
+}> {
+  return cacheFetch(
+    `tree-raw:v2:${credKey(creds)}`,
+    TTL_TREE_MS,
+    () =>
+      fetchRuijie<{
+        code: number;
+        msg: string;
+        groupId?: number;
+        rootGroupId?: number;
+        groups: GroupTreeNode;
+      }>(creds, "/service/api/group/single/tree")
+  );
+}
+
 export async function fetchProjectTree(
   creds: RuijieCredentials
 ): Promise<{ tree: ProjectTreeNode[]; flat: RuijieProject[] }> {
   // v3: include leaf latitude/longitude from the group tree (province/geo).
   return cacheFetch(`tree:v3:${credKey(creds)}`, TTL_TREE_MS, async () => {
-    const data = await fetchRuijie<{
-      code: number;
-      msg: string;
-      groups: GroupTreeNode;
-    }>(creds, "/service/api/group/single/tree");
+    const data = await fetchGroupTreeRaw(creds);
 
     if (data.code !== 0 || !data.groups) {
       throw new Error(
@@ -386,22 +408,11 @@ function flattenGroupTree(
 export async function getProjects(
   creds: RuijieCredentials
 ): Promise<RuijieProject[]> {
-  // v3: include leaf latitude/longitude; drop pre-geo flat lists.
-  return cacheFetch(`projects:v3:${credKey(creds)}`, TTL_TREE_MS, async () => {
-    const data = await fetchRuijie<{
-      code: number;
-      msg: string;
-      groups: GroupTreeNode;
-    }>(creds, "/service/api/group/single/tree");
-
-    if (data.code !== 0 || !data.groups) {
-      throw new Error(
-        `Failed to fetch groups (code ${data.code}): ${data.msg}`
-      );
-    }
-
-    return flattenGroupTree(data.groups);
-  });
+  // Shares the tree cache with fetchProjectTree — the flat list is the same
+  // flattenGroupTree output, so a separate projects: cache key only caused a
+  // second live call to the same endpoint on every Sync devices.
+  const { flat } = await fetchProjectTree(creds);
+  return flat;
 }
 
 function collectLeafIdList(nodes: ProjectTreeNode[]): number[] {
@@ -563,7 +574,13 @@ async function fetchDevicesPage(
   creds: RuijieCredentials,
   groupId: number,
   page: number
-): Promise<{ code: number; msg: string; deviceList?: RuijieDevice[]; totalCount?: number }> {
+): Promise<{
+  code: number;
+  msg: string;
+  deviceList?: RuijieDevice[];
+  totalCount?: number;
+  count?: number;
+}> {
   return fetchRuijie(
     creds,
     `/service/api/maint/devices?group_id=${groupId}&page=${page}&per_page=200`
@@ -755,14 +772,16 @@ export function invalidateDeviceStatus(creds: RuijieCredentials): void {
 }
 
 /**
- * Settings → Fetch devices: drop site tree, device meta/membership, and
- * related caches so the next load discovers new devices/sites.
+ * Settings → Fetch devices: drop site tree and related caches so the next
+ * load discovers new devices/sites.
+ *
+ * The device store is deliberately KEPT: applyFleetToStore fully replaces
+ * meta/status on a successful sync, while wiping it first meant a failed sync
+ * (rate limit mid-way, partial fleet page error) left the credential with no
+ * inventory at all until the durable Supabase copy could be rehydrated.
  */
 export function invalidateCredentialCaches(creds: RuijieCredentials): void {
   const key = credKey(creds);
-  deviceStores.delete(key);
-  cacheClear(`device-store:${key}`);
-  diskDelete(`device-store:${key}`);
   for (const prefix of [
     "tree:",
     "tree:v2:",
@@ -815,18 +834,7 @@ async function fetchFleetRaw(
     `fleet-raw:${credKey(creds)}`,
     TTL_DEVICE_META_MS,
     async () => {
-      const treeData = await cacheFetch(
-        `tree-raw:v2:${credKey(creds)}`,
-        TTL_TREE_MS,
-        () =>
-          fetchRuijie<{
-            code: number;
-            msg: string;
-            groupId?: number;
-            rootGroupId?: number;
-            groups: GroupTreeNode;
-          }>(creds, "/service/api/group/single/tree")
-      );
+      const treeData = await fetchGroupTreeRaw(creds);
 
       if (treeData.code !== 0 || !treeData.groups) {
         throw new Error(
@@ -862,19 +870,30 @@ async function fetchFleetRaw(
       for (let page = 1; page <= 50; page++) {
         const data = await fetchDevicesPage(creds, rootId, page);
         if (data.code !== 0) {
-          if (page === 1) {
-            console.error(`Ruijie fleet error (code ${data.code}): ${data.msg}`);
-          }
-          // code 5 etc. — don't cache a partial empty fleet as success
-          if (page === 1 && all.length === 0) {
-            throw new Error(`Ruijie fleet denied (code ${data.code}): ${data.msg}`);
-          }
-          break;
+          console.error(
+            `Ruijie fleet error (code ${data.code}) on page ${page}: ${data.msg}`
+          );
+          // Never return a partial fleet as success: applyFleetToStore would
+          // prune every device past the failed page from the inventory, and
+          // the partial result would be cached for days. Throwing lets the
+          // caller keep the previous inventory and report the failure.
+          throw new Error(
+            `Ruijie fleet denied (code ${data.code}) on page ${page}: ${data.msg}`
+          );
         }
         const list = data.deviceList || [];
         all.push(...list);
-        const total = data.totalCount ?? 0;
-        if (!list.length || all.length >= total) break;
+        // Some responses omit totalCount (or nest it) — treating a missing
+        // total as 0 stopped pagination after page 1, silently truncating
+        // every account with more than one page of devices. Only trust a
+        // positive total; otherwise stop on the first short page.
+        const total = data.totalCount ?? data.count ?? 0;
+        if (!list.length) break;
+        if (total > 0) {
+          if (all.length >= total) break;
+        } else if (list.length < 200) {
+          break;
+        }
       }
       return all;
     }
@@ -946,11 +965,17 @@ export async function getFleetDevices(
     if (mode === "meta") return fleet;
     return store.meta.size > 0 ? mergeStore(store) : [];
   } catch (err) {
+    // Explicit refresh (Sync devices) must report failure — swallowing the
+    // error would make the sync claim success with the previous inventory.
+    if (mode === "meta") throw err;
     if (store.meta.size > 0 && store.status.size > 0) {
       // Keep previous statusCheckedAt so the next call retries the check.
       return mergeStore(store);
     }
-    if (mode === "status") return [];
+    // No inventory to fall back on (cold start, no durable copy): rethrow so
+    // callers mark the build degraded. Returning [] here was treated as a
+    // healthy zero-device fleet — every owned site got totalCount 0, was
+    // filtered out, and the empty dashboard was cached as healthy for 10 min.
     throw err;
   }
 }

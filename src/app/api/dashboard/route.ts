@@ -86,7 +86,13 @@ export interface RateLimitedCredential {
   retryInSeconds: number;
 }
 
-async function getUser(request: Request) {
+interface ResolvedUser {
+  user: { id: string } | null;
+  /** Present when the access token was expired and the refresh token renewed it. */
+  refreshedTokens?: { accessToken: string; refreshToken: string };
+}
+
+async function getUser(request: Request): Promise<ResolvedUser> {
   const cookieHeader = request.headers.get("cookie") || "";
   const cookies = Object.fromEntries(
     cookieHeader.split(";").map((c) => {
@@ -96,11 +102,59 @@ async function getUser(request: Request) {
   );
 
   const accessToken = cookies["sb-access-token"];
-  if (!accessToken) return null;
-
+  const refreshToken = cookies["sb-refresh-token"];
   const supabase = getSupabaseServiceRole();
-  const { data } = await supabase.auth.getUser(accessToken);
-  return data.user;
+
+  if (accessToken) {
+    const { data } = await supabase.auth.getUser(accessToken);
+    if (data.user) return { user: data.user };
+  }
+
+  // The Supabase access token expires after ~1 hour. Self-heal here with the
+  // refresh token so the dashboard does not 401 and depend on a client
+  // round-trip — that 401 is what left the dashboard frozen (no sites) after
+  // an hour of auto-updates. The renewed tokens are returned so the route can
+  // set them as cookies, keeping the session continuous.
+  if (refreshToken) {
+    const { data, error } = await supabase.auth.refreshSession({
+      refresh_token: refreshToken,
+    });
+    if (!error && data.session && data.user) {
+      return {
+        user: data.user,
+        refreshedTokens: {
+          accessToken: data.session.access_token,
+          refreshToken: data.session.refresh_token,
+        },
+      };
+    }
+  }
+
+  return { user: null };
+}
+
+/** Attach renewed auth cookies (from a server-side token refresh) to a response. */
+function applyRefreshedAuth(
+  response: NextResponse,
+  refreshedTokens?: { accessToken: string; refreshToken: string }
+): NextResponse {
+  if (!refreshedTokens) return response;
+  const secure = process.env.NODE_ENV === "production";
+  response.cookies.set("sb-access-token", refreshedTokens.accessToken, {
+    httpOnly: true,
+    secure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 7,
+  });
+  response.cookies.set("sb-refresh-token", refreshedTokens.refreshToken, {
+    httpOnly: true,
+    secure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 30,
+  });
+  return response;
 }
 
 export interface ProjectWithDevices extends RuijieProject {
@@ -281,12 +335,15 @@ export async function GET(request: Request) {
   // durable payload instead of a bare 500.
   let userId: string | null = null;
   let creds: CredentialRow[] | null = null;
+  let refreshedTokens: { accessToken: string; refreshToken: string } | undefined;
   try {
-    const user = await getUser(request);
-    if (!user) {
+    const resolved = await getUser(request);
+    if (!resolved.user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    const user = resolved.user;
     userId = user.id;
+    refreshedTokens = resolved.refreshedTokens;
 
     const supabase = getSupabaseServiceRole();
     const { data: credsData, error: credsError } = await supabase
@@ -303,14 +360,17 @@ export async function GET(request: Request) {
     creds = credRows;
 
     if (credRows.length === 0) {
-      return NextResponse.json({
-        projects: [],
-        offlineDevices: [],
-        offlineSites: [],
-        rateLimitedCredentials: [],
-        statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
-        nextUpdateInSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
-      });
+      return applyRefreshedAuth(
+        NextResponse.json({
+          projects: [],
+          offlineDevices: [],
+          offlineSites: [],
+          rateLimitedCredentials: [],
+          statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+          nextUpdateInSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+        }),
+        refreshedTokens
+      );
     }
 
     const cacheKey = `dashboard:${user.id}`;
@@ -489,17 +549,21 @@ export async function GET(request: Request) {
     // explicit error instead of an empty-but-"successful" dashboard, so the
     // client shows the failure banner and retries with backoff.
     if (!payload) {
-      return NextResponse.json({
-        projects: [],
-        offlineDevices: [],
-        offlineSites: [],
-        rateLimitedCredentials: [],
-        degraded: true,
-        rebuilding: true,
-        error: rebuildError || "Dashboard rebuild did not finish",
-        statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
-        nextUpdateInSeconds: REVALIDATE_POLL_SECONDS,
-      });
+      return applyRefreshedAuth(
+        NextResponse.json({
+          projects: [],
+          offlineDevices: [],
+          offlineSites: [],
+          rateLimitedCredentials: [],
+          degraded: true,
+          rebuilding: true,
+          error: rebuildError || "Dashboard rebuild did not finish",
+          statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+          nextUpdateInSeconds: REVALIDATE_POLL_SECONDS,
+          nextUpdateAt: Date.now() + REVALIDATE_POLL_SECONDS * 1000,
+        }),
+        refreshedTokens
+      );
     }
 
     // Overlay live cooldown state on every response — even when the dashboard
@@ -541,18 +605,40 @@ export async function GET(request: Request) {
       cacheSet(cacheKey, response, ttl);
     }
 
-    // Always report the full status interval so the visible countdown is a
-    // steady 10 minutes. (A "remaining cache window" countdown made the timer
-    // shrink to 30s after rebuilds/rate-limit holds, which looked broken.)
-    const nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
+    // Next-update signal. For a healthy payload, report an ABSOLUTE deadline
+    // (builtAt + status TTL) so every device on this account counts down to
+    // the SAME moment — a relative "full interval" countdown drifted per
+    // device. For rebuilding / rate-limited responses, report a near-future
+    // poll target so the client picks up the fresh payload (or lifted
+    // cooldown) promptly.
+    const builtAtForNext =
+      typeof response.builtAt === "number" ? response.builtAt : Date.now();
+    const rateLimitedNow = response.rateLimitedCredentials.length > 0;
+    let nextUpdateInSeconds = DEVICE_STATUS_INTERVAL_SECONDS;
+    let nextUpdateAt = builtAtForNext + DASHBOARD_TTL_MS;
+    if (rebuilding) {
+      nextUpdateInSeconds = REVALIDATE_POLL_SECONDS;
+      nextUpdateAt = Date.now() + REVALIDATE_POLL_SECONDS * 1000;
+    } else if (rateLimitedNow || response.degraded) {
+      nextUpdateInSeconds = Math.ceil(DEGRADED_TTL_MS / 1000);
+      nextUpdateAt = Date.now() + DEGRADED_TTL_MS;
+    } else if (nextUpdateAt <= Date.now()) {
+      // At/past TTL — the next fetch triggers a rebuild.
+      nextUpdateInSeconds = REVALIDATE_POLL_SECONDS;
+      nextUpdateAt = Date.now() + REVALIDATE_POLL_SECONDS * 1000;
+    }
 
-    return NextResponse.json({
-      ...response,
-      statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
-      nextUpdateInSeconds,
-      rebuilding,
-      error: rebuildError || undefined,
-    });
+    return applyRefreshedAuth(
+      NextResponse.json({
+        ...response,
+        statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+        nextUpdateInSeconds,
+        nextUpdateAt,
+        rebuilding,
+        error: rebuildError || undefined,
+      }),
+      refreshedTokens
+    );
   } catch (error) {
     // Last-resort durable fallback — a 500 with nothing in it is what left the
     // dashboard empty after a failed rebuild. Answer with the last known
@@ -563,13 +649,18 @@ export async function GET(request: Request) {
         const durable = await durableLoad<DashboardPayload>(userId);
         if (durable) {
           const response = applyLiveRateLimits(durable.payload, creds);
-          return NextResponse.json({
-            ...response,
-            statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
-            nextUpdateInSeconds: REVALIDATE_POLL_SECONDS,
-            rebuilding: true,
-            error: error instanceof Error ? error.message : "Internal server error",
-          });
+          return applyRefreshedAuth(
+            NextResponse.json({
+              ...response,
+              statusIntervalSeconds: DEVICE_STATUS_INTERVAL_SECONDS,
+              nextUpdateInSeconds: REVALIDATE_POLL_SECONDS,
+              nextUpdateAt: Date.now() + REVALIDATE_POLL_SECONDS * 1000,
+              rebuilding: true,
+              error:
+                error instanceof Error ? error.message : "Internal server error",
+            }),
+            refreshedTokens
+          );
         }
       } catch {
         // fall through to plain 500 below
@@ -841,11 +932,16 @@ async function buildDashboard(
         return hit.rows;
       }
 
+      // Only the receiving credential is expected to answer for a shared
+      // group — if another linked credential owned the group its fleet would
+      // already have answered (fleetByGroup) and we would not be here. The
+      // old "try every credential" loop cost a throttled round-trip per
+      // credential per offline group (~10 groups × 4 creds ≈ 20s on a cold
+      // build), pushing the rebuild past FIRST_BUILD_WAIT_MS so the
+      // dashboard answered empty ("rebuild did not finish"). Call logs show
+      // every credential returning empty for foreign shared groups anyway.
       const ordered = preferCredId
-        ? [
-            ...creds.filter((c) => c.id === preferCredId),
-            ...creds.filter((c) => c.id !== preferCredId),
-          ]
+        ? creds.filter((c) => c.id === preferCredId)
         : creds;
 
       let rows: RuijieWarnLog[] = [];
